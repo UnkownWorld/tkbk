@@ -148,8 +148,11 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
     - 批次间随机延迟避免限速
     """
     try:
+        logger.info(f"[线程{file_idx}] 开始执行 process_single_novel, task_id={task_id}")
         task = task_store.get_task_ref(task_id)
+        logger.info(f"[线程{file_idx}] 任务状态: {task.get('status') if task else 'None'}")
         if not task or task.get("status") in ("cancelled", "completed"):
+            logger.warning(f"[线程{file_idx}] 任务不存在或已完成，跳过")
             return
 
         # 获取章节列表（深拷贝，避免共享引用问题）
