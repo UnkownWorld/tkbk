@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Workflow Assistant</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-card: #1e293b;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --border: #334155;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; }
+        .app-container { display: flex; height: 100vh; }
+
+        /* 侧边栏 */
+        .sidebar { width: 220px; background: var(--bg-secondary); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
+        .sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); }
+        .sidebar-header h2 { font-size: 15px; font-weight: 600; }
+        .sidebar-nav { padding: 8px; flex: 1; overflow-y: auto; }
+        .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); font-size: 14px; transition: all 0.15s; margin-bottom: 2px; }
+        .nav-item:hover { background: rgba(255,255,255,0.05); color: var(--text-primary); }
+        .nav-item.active { background: var(--primary); color: white; }
+        .nav-item .icon { font-size: 18px; width: 24px; text-align: center; }
+
+        /* 主内容 */
+        .main-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .page-header { padding: 14px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+        .page-header h1 { font-size: 18px; font-weight: 600; }
+        .page-header-actions { display: flex; align-items: center; gap: 8px; }
+        .page-body { flex: 1; overflow-y: auto; padding: 24px; }
+
+        /* 页面 */
+        .page { display: none; flex-direction: column; height: 100%; }
+        .page.active { display: flex; }
+
+        /* 表单 */
+        .form-group { margin-bottom: 14px; }
+        .form-label { display: block; font-size: 13px; color: var(--text-secondary); margin-bottom: 5px; font-weight: 500; }
+        .form-input { width: 100%; padding: 9px 12px; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); font-size: 14px; outline: none; transition: border-color 0.15s; }
+        .form-input:focus { border-color: var(--primary); }
+        .form-input::placeholder { color: var(--text-muted); }
+        select.form-input { cursor: pointer; }
+        textarea.form-input { resize: vertical; min-height: 80px; font-family: inherit; }
+
+        /* 按钮 */
+        .btn { padding: 8px 16px; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover { background: var(--primary-hover); }
+        .btn-secondary { background: var(--border); color: var(--text-primary); }
+        .btn-secondary:hover { background: rgba(255,255,255,0.1); }
+        .btn-danger { background: var(--error); color: white; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-success { background: var(--success); color: white; }
+        .btn-sm { padding: 5px 10px; font-size: 13px; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* 卡片 */
+        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+        .card-title { font-size: 15px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+
+        /* 聊天 */
+        .chat-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .chat-messages { flex: 1; overflow-y: auto; padding: 16px 24px; }
+        .chat-message { margin-bottom: 16px; display: flex; gap: 12px; }
+        .chat-message.user { flex-direction: row-reverse; }
+        .chat-avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
+        .chat-message.assistant .chat-avatar { background: var(--primary); }
+        .chat-message.user .chat-avatar { background: var(--success); }
+        .chat-bubble { max-width: 70%; padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+        .chat-message.assistant .chat-bubble { background: var(--bg-secondary); border: 1px solid var(--border); }
+        .chat-message.user .chat-bubble { background: var(--primary); color: white; }
+        .chat-input-area { padding: 14px 24px; border-top: 1px solid var(--border); display: flex; gap: 12px; flex-shrink: 0; }
+        .chat-input-area textarea { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; color: var(--text-primary); font-size: 14px; resize: none; outline: none; min-height: 44px; max-height: 120px; font-family: inherit; }
+        .chat-input-area textarea:focus { border-color: var(--primary); }
+
+        /* 批处理文件卡片 */
+        .batch-file-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+        .batch-file-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .batch-file-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+        .batch-file-meta { font-size: 12px; color: var(--text-muted); }
+        .batch-file-config { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+        .batch-file-config label { font-size: 13px; color: var(--text-secondary); white-space: nowrap; }
+        .batch-file-config select, .batch-file-config input { flex: 1; }
+
+        .batch-upload-area { border: 2px dashed var(--border); border-radius: 12px; padding: 36px; text-align: center; cursor: pointer; transition: all 0.15s; }
+        .batch-upload-area:hover { border-color: var(--primary); background: rgba(59,130,246,0.05); }
+
+        /* 任务列表 */
+        .task-item { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; }
+        .task-info { flex: 1; min-width: 0; }
+        .task-name { font-weight: 500; font-size: 14px; }
+        .task-meta { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+        .task-files-brief { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+        .task-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+        .task-status { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
+        .task-status.pending { background: rgba(245,158,11,0.15); color: var(--warning); }
+        .task-status.processing { background: rgba(59,130,246,0.15); color: var(--primary); }
+        .task-status.completed { background: rgba(34,197,94,0.15); color: var(--success); }
+        .task-status.failed { background: rgba(239,68,68,0.15); color: var(--error); }
+        .task-status.cancelled { background: rgba(100,116,139,0.15); color: var(--text-muted); }
+        .progress-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-top: 8px; }
+        .progress-fill { height: 100%; background: var(--primary); border-radius: 2px; transition: width 0.3s; }
+
+        /* 文件列表 */
+        .file-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
+
+        /* 模态框 */
+        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+        .modal-overlay.hidden { display: none; }
+        .modal { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 16px; width: 92%; max-width: 600px; max-height: 85vh; overflow-y: auto; }
+        .modal.modal-wide { max-width: 900px; }
+        .modal-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; background: var(--bg-secondary); z-index: 1; }
+        .modal-header h3 { font-size: 16px; }
+        .modal-body { padding: 20px; }
+        .modal-footer { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; position: sticky; bottom: 0; background: var(--bg-secondary); }
+        .close-btn { background: none; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 4px; }
+        .close-btn:hover { color: var(--text-primary); }
+
+        /* Toast */
+        .toast-container { position: fixed; top: 20px; right: 20px; z-index: 2000; display: flex; flex-direction: column; gap: 8px; }
+        .toast { padding: 12px 20px; border-radius: 8px; font-size: 14px; animation: slideIn 0.3s; max-width: 360px; }
+        .toast-info { background: var(--primary); color: white; }
+        .toast-success { background: var(--success); color: white; }
+        .toast-error { background: var(--error); color: white; }
+        .toast-warning { background: var(--warning); color: #1e293b; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        /* Loading */
+        .global-loading { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 3000; }
+        .global-loading.hidden { display: none; }
+        .loading-spinner { width: 40px; height: 40px; border: 3px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-text { color: var(--text-secondary); font-size: 14px; }
+
+        /* 状态标签 */
+        .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 12px; }
+        .status-badge.configured { background: rgba(34,197,94,0.15); color: var(--success); }
+        .status-badge.not-configured { background: rgba(100,116,139,0.15); color: var(--text-muted); }
+        .status-dot { width: 6px; height: 6px; border-radius: 50%; }
+        .status-badge.configured .status-dot { background: var(--success); }
+        .status-badge.not-configured .status-dot { background: var(--text-muted); }
+
+        /* 密码输入 */
+        .secret-input-wrapper { position: relative; }
+        .secret-input-wrapper .toggle-visibility { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; padding: 4px; }
+        .secret-input-wrapper .toggle-visibility:hover { color: var(--text-primary); }
+
+        /* 任务查看 - 章节结果 */
+        .result-file-section { margin-bottom: 24px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+        .result-file-title { font-size: 15px; font-weight: 600; padding: 14px 16px; background: rgba(59,130,246,0.08); border-bottom: 1px solid var(--border); }
+        .result-batch { border-bottom: 1px solid var(--border); }
+        .result-batch:last-child { border-bottom: none; }
+        .result-batch-header { padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; background: rgba(255,255,255,0.02); }
+        .result-batch-header:hover { background: rgba(255,255,255,0.05); }
+        .result-batch-title { font-size: 13px; font-weight: 500; }
+        .result-batch-status { font-size: 12px; }
+        .result-batch-status.success { color: var(--success); }
+        .result-batch-status.fail { color: var(--error); }
+        .result-batch-titles { padding: 8px 14px; font-size: 12px; color: var(--text-muted); line-height: 1.5; border-top: 1px solid var(--border); }
+        .result-batch-preview { padding: 10px 14px; font-size: 13px; color: var(--text-secondary); line-height: 1.5; border-top: 1px solid var(--border); }
+        .result-batch-full { padding: 14px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; border-top: 1px solid var(--border); display: none; background: var(--bg-primary); }
+        .result-batch-full.expanded { display: block; }
+
+        .hidden { display: none !important; }
+        .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+        .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+        .empty-state p { font-size: 14px; }
+
+        .config-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: background 0.15s; }
+        .config-item:hover { background: rgba(255,255,255,0.03); }
+        .config-item .name { font-size: 14px; font-weight: 500; }
+        .config-item .desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+        .section-divider { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 16px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+
+        /* 线程池设置 */
+        .thread-settings { display: flex; align-items: center; gap: 12px; padding: 12px; background: var(--bg-primary); border-radius: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+        .thread-settings label { font-size: 13px; color: var(--text-secondary); white-space: nowrap; }
+        .thread-settings input { width: 80px; }
+        .thread-settings .status { font-size: 12px; color: var(--text-muted); }
+
+        @media (max-width: 768px) {
+            .sidebar { width: 56px; }
+            .sidebar-header h2, .nav-item span { display: none; }
+            .nav-item { justify-content: center; padding: 12px; }
+            .page-body { padding: 16px; }
+            .task-item { flex-direction: column; align-items: flex-start; gap: 8px; }
+            .task-actions { width: 100%; justify-content: flex-end; }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app-container">
+        <div class="sidebar">
+            <div class="sidebar-header"><h2>🤖 AI 助手</h2></div>
+            <div class="sidebar-nav">
+                <div class="nav-item active" data-page="chat"><span class="icon">💬</span><span>聊天</span></div>
+                <div class="nav-item" data-page="batch"><span class="icon">📦</span><span>批处理</span></div>
+                <div class="nav-item" data-page="tasks"><span class="icon">📋</span><span>任务管理</span></div>
+                <div class="nav-item" data-page="cloud"><span class="icon">☁️</span><span>云端文件</span></div>
+                <div class="nav-item" data-page="settings"><span class="icon">⚙️</span><span>设置</span></div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <!-- 聊天 -->
+            <div class="page active" id="page-chat">
+                <div class="page-header">
+                    <h1>💬 聊天</h1>
+                    <div class="page-header-actions">
+                        <select id="chatConfigSelect" class="form-input" style="width:180px;padding:6px 10px;font-size:13px;">
+                            <option value="">默认配置</option>
+                        </select>
+                        <button class="btn btn-sm btn-secondary" id="btnNewConv">+ 新对话</button>
+                    </div>
+                </div>
+                <div class="chat-container">
+                    <div class="chat-messages" id="chatMessages">
+                        <div class="empty-state"><div class="icon">💬</div><p>选择配置，开始新对话</p></div>
+                    </div>
+                    <div class="chat-input-area">
+                        <textarea id="chatInput" placeholder="输入消息... (Ctrl+Enter 发送)" rows="1"></textarea>
+                        <button class="btn btn-primary" id="btnSendMessage">发送</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 批处理 -->
+            <div class="page" id="page-batch">
+                <div class="page-header"><h1>📦 批处理</h1></div>
+                <div class="page-body">
+                    <div class="card">
+                        <div class="card-title">添加小说文件</div>
+                        <div class="batch-upload-area" id="batchUploadArea">
+                            <div style="font-size:32px;margin-bottom:10px;">📄</div>
+                            <p>点击或拖拽 .txt 文件到此处（支持多个文件）</p>
+                        </div>
+                        <input type="file" id="batchFileInput" accept=".txt" multiple style="display:none">
+                    </div>
+                    
+                    <!-- 全局批次设置 -->
+                    <div class="card" id="batchSettingsCard" style="display:none;">
+                        <div class="card-title">批处理设置</div>
+                        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                            <label style="font-size:13px;color:var(--text-secondary);">默认批次大小：</label>
+                            <input type="number" id="globalBatchSize" class="form-input" min="1" max="50" value="10" style="width:80px;">
+                            <span style="font-size:12px;color:var(--text-muted);">章/批次（每本书可单独设置）</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;">
+                            <label style="font-size:13px;color:var(--text-secondary);">批次间延迟：</label>
+                            <input type="number" id="globalDelayMin" class="form-input" min="0" max="300" value="15" style="width:70px;">
+                            <span style="font-size:12px;color:var(--text-muted);">~</span>
+                            <input type="number" id="globalDelayMax" class="form-input" min="0" max="300" value="45" style="width:70px;">
+                            <span style="font-size:12px;color:var(--text-muted);">秒（随机延迟避免限速）</span>
+                        </div>
+                    </div>
+                    
+                    <div id="batchFileList"></div>
+                    <div id="batchSubmitArea" class="hidden" style="margin-top:16px;">
+                        <button class="btn btn-primary" id="btnSubmitBatch" style="padding:12px 32px;font-size:15px;">🚀 开始批处理</button>
+                        <button class="btn btn-secondary" id="btnClearBatch" style="margin-left:8px;">清除全部</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 任务管理 -->
+            <div class="page" id="page-tasks">
+                <div class="page-header">
+                    <h1>📋 任务管理</h1>
+                    <button class="btn btn-sm btn-secondary" id="btnRefreshTasks">🔄 刷新</button>
+                </div>
+                <div class="page-body" id="taskList">
+                    <div class="empty-state"><div class="icon">📋</div><p>暂无任务</p></div>
+                </div>
+            </div>
+
+            <!-- 云端文件 -->
+            <div class="page" id="page-cloud">
+                <div class="page-header">
+                    <h1>☁️ 云端文件</h1>
+                    <button class="btn btn-sm btn-secondary" id="btnRefreshCloudFiles">🔄 刷新</button>
+                </div>
+                <div class="page-body">
+                    <div class="card" style="margin-bottom:16px;">
+                        <div class="card-title">HF 数据集配置</div>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                            <div style="flex:1;min-width:200px;">
+                                <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">HF Token</label>
+                                <input type="password" id="cloudHfToken" placeholder="留空使用服务器默认" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text);font-size:13px;">
+                            </div>
+                            <div style="flex:1;min-width:200px;">
+                                <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">数据集名称</label>
+                                <input type="text" id="cloudHfDataset" placeholder="如: username/bk1，留空使用默认" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text);font-size:13px;">
+                            </div>
+                            <button class="btn btn-primary" onclick="refreshCloudFiles()">📂 查看文件</button>
+                        </div>
+                    </div>
+                    <div id="cloudFileList">
+                        <div class="empty-state"><div class="icon">☁️</div><p>点击刷新加载文件列表</p></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 设置 -->
+            <div class="page" id="page-settings">
+                <div class="page-header"><h1>⚙️ 设置</h1></div>
+                <div class="page-body">
+                    <!-- 服务器默认配置状态 -->
+                    <div class="card">
+                        <div class="card-title">服务器配置状态</div>
+                        <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">以下为服务器端预配置的敏感信息状态。</p>
+                        <div id="serverConfigStatus" style="display:flex;flex-direction:column;gap:8px;"></div>
+                    </div>
+
+                    <!-- 线程池设置 -->
+                    <div class="card">
+                        <div class="card-title">线程池设置</div>
+                        <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">调整并发处理能力。并发数控制同时处理的书籍数，线程池大小控制后台任务处理能力。</p>
+                        <div class="thread-settings">
+                            <label>并发数：</label>
+                            <input type="number" id="maxConcurrent" class="form-input" min="1" max="50" value="10">
+                            <label>线程池：</label>
+                            <input type="number" id="threadPoolSize" class="form-input" min="1" max="100" value="10">
+                            <button class="btn btn-sm btn-primary" id="btnSaveThreadSettings">保存</button>
+                            <span class="status" id="threadStatus"></span>
+                        </div>
+                    </div>
+
+                    <!-- 批次延迟设置 -->
+                    <div class="card">
+                        <div class="card-title">批次延迟设置</div>
+                        <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">批次间随机延迟，避免API限速。设为0则不延迟。</p>
+                        <div class="thread-settings">
+                            <label>最小延迟：</label>
+                            <input type="number" id="batchDelayMin" class="form-input" min="0" max="300" value="15">
+                            <label>最大延迟：</label>
+                            <input type="number" id="batchDelayMax" class="form-input" min="0" max="300" value="45">
+                            <label>秒</label>
+                            <button class="btn btn-sm btn-primary" id="btnSaveDelaySettings">保存</button>
+                            <span class="status" id="delayStatus"></span>
+                        </div>
+                    </div>
+
+                    <!-- 默认配置编辑 -->
+                    <div class="card">
+                        <div class="card-title">默认配置</div>
+                        <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">修改下方参数将作为全局默认值，所有使用"默认配置"的聊天和批处理都会生效。留空则恢复服务器原始值。</p>
+
+                        <div class="form-group">
+                            <label class="form-label">API 地址</label>
+                            <input type="text" id="defApiHost" class="form-input" placeholder="留空使用服务器默认">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">模型</label>
+                            <input type="text" id="defModel" class="form-input" placeholder="留空使用服务器默认">
+                        </div>
+                        <div style="display:flex;gap:12px;">
+                            <div class="form-group" style="flex:1;">
+                                <label class="form-label">Temperature</label>
+                                <input type="number" id="defTemperature" class="form-input" step="0.1" min="0" max="2">
+                            </div>
+                            <div class="form-group" style="flex:1;">
+                                <label class="form-label">Top P</label>
+                                <input type="number" id="defTopP" class="form-input" step="0.05" min="0" max="1">
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:12px;">
+                            <div class="form-group" style="flex:1;">
+                                <label class="form-label">上下文轮数</label>
+                                <input type="number" id="defContextRounds" class="form-input" min="1" max="500">
+                            </div>
+                            <div class="form-group" style="flex:1;">
+                                <label class="form-label">最大输出 Token</label>
+                                <input type="number" id="defMaxOutputTokens" class="form-input" min="100">
+                            </div>
+                        </div>
+
+                        <div class="section-divider">💬 聊天功能 - 系统提示词</div>
+                        <div class="form-group">
+                            <label class="form-label">System Prompt（聊天）</label>
+                            <textarea id="defSystemPrompt" class="form-input" rows="4" placeholder="留空使用服务器默认"></textarea>
+                        </div>
+
+                        <div class="section-divider">📦 批处理功能 - 提示词模板</div>
+                        <div class="form-group">
+                            <label class="form-label">System Prompt（批处理）</label>
+                            <textarea id="defBatchSystemPrompt" class="form-input" rows="4" placeholder="批处理时使用的系统提示词，留空使用聊天提示词"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">User Prompt 模板（批处理）</label>
+                            <textarea id="defBatchUserPromptTemplate" class="form-input" rows="4" placeholder="使用 {content} 作为章节内容占位符，留空则直接使用章节内容"></textarea>
+                            <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">例如：请分析以下小说章节的节奏：\n\n{content}</p>
+                        </div>
+
+                        <button class="btn btn-primary" id="btnSaveDefaults">💾 保存默认配置</button>
+                    </div>
+
+                    <!-- 配置管理 -->
+                    <div class="card">
+                        <div class="card-title">
+                            自定义配置
+                            <button class="btn btn-sm btn-primary" id="btnNewConfig">+ 新建配置</button>
+                        </div>
+                        <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">创建不同配置，在聊天和批处理中选择使用。新建配置会预填默认值，你只需修改需要的部分。</p>
+                        <div id="configList"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 配置编辑模态框 -->
+    <div id="configModal" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="configModalTitle">新建配置</h3>
+                <button class="close-btn" id="btnCloseConfigModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">配置名称</label>
+                    <input type="text" id="cfgName" class="form-input" placeholder="如: 翻译助手、小说润色">
+                </div>
+
+                <div class="section-divider">💬 聊天功能 - 系统提示词</div>
+                <div class="form-group">
+                    <label class="form-label">System Prompt（聊天）</label>
+                    <textarea id="cfgSystemPrompt" class="form-input" rows="3" placeholder="留空使用默认"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">上下文轮数</label>
+                    <input type="number" id="cfgContextRounds" class="form-input" min="1" max="500" placeholder="留空使用默认">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">最大输出 Token</label>
+                    <input type="number" id="cfgMaxOutputTokens" class="form-input" min="100" placeholder="留空使用默认">
+                </div>
+
+                <div class="section-divider">📦 批处理功能 - 提示词模板</div>
+                <div class="form-group">
+                    <label class="form-label">System Prompt（批处理）</label>
+                    <textarea id="cfgBatchSystemPrompt" class="form-input" rows="3" placeholder="批处理时使用的系统提示词，留空使用聊天提示词"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">User Prompt 模板（批处理）</label>
+                    <textarea id="cfgBatchUserPromptTemplate" class="form-input" rows="3" placeholder="使用 {content} 作为章节内容占位符，留空则直接使用章节内容"></textarea>
+                    <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">例如：请分析以下小说章节的节奏：\n\n{content}</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">批次大小</label>
+                    <input type="number" id="cfgBatchSize" class="form-input" min="1" max="50" placeholder="每批次章节数，默认10">
+                </div>
+
+                <div class="section-divider">🔗 API 配置</div>
+                <div class="form-group">
+                    <label class="form-label">API 地址</label>
+                    <input type="text" id="cfgApiHost" class="form-input" placeholder="留空使用默认">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">API Key（仅自己可见）</label>
+                    <div class="secret-input-wrapper">
+                        <input type="password" id="cfgApiKey" class="form-input" placeholder="留空使用默认，修改时输入新值" autocomplete="off">
+                        <button class="toggle-visibility" data-target="cfgApiKey">👁️</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">模型</label>
+                    <input type="text" id="cfgModel" class="form-input" placeholder="留空使用默认">
+                </div>
+                <div style="display:flex;gap:12px;">
+                    <div class="form-group" style="flex:1;">
+                        <label class="form-label">Temperature</label>
+                        <input type="number" id="cfgTemperature" class="form-input" step="0.1" min="0" max="2" placeholder="默认">
+                    </div>
+                    <div class="form-group" style="flex:1;">
+                        <label class="form-label">Top P</label>
+                        <input type="number" id="cfgTopP" class="form-input" step="0.05" min="0" max="1" placeholder="默认">
+                    </div>
+                </div>
+
+                <div class="section-divider">☁️ HF 数据集配置</div>
+                <div class="form-group">
+                    <label class="form-label">HF Token（仅自己可见）</label>
+                    <div class="secret-input-wrapper">
+                        <input type="password" id="cfgHfToken" class="form-input" placeholder="留空使用默认，修改时输入新值" autocomplete="off">
+                        <button class="toggle-visibility" data-target="cfgHfToken">👁️</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">HF 数据集名称</label>
+                    <input type="text" id="cfgHfDataset" class="form-input" placeholder="如: username/bk1，留空使用默认">
+                    <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">数据集将自动创建为 private</p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-danger" id="btnDeleteConfig" style="display:none;margin-right:auto;">删除配置</button>
+                <button class="btn btn-secondary" id="btnCancelConfig">取消</button>
+                <button class="btn btn-primary" id="btnSaveConfig">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 任务查看模态框 -->
+    <div id="taskViewModal" class="modal-overlay hidden">
+        <div class="modal modal-wide">
+            <div class="modal-header">
+                <h3 id="taskViewTitle">任务结果</h3>
+                <button class="close-btn" id="btnCloseTaskView">&times;</button>
+            </div>
+            <div class="modal-body" id="taskViewBody"></div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="btnDownloadFromView">📥 下载全部结果</button>
+                <button class="btn btn-secondary" id="btnCloseTaskView2">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="globalLoading" class="global-loading hidden">
+        <div style="text-align:center;">
+            <div class="loading-spinner"></div>
+            <div id="globalLoadingText" class="loading-text">处理中...</div>
+        </div>
+    </div>
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
