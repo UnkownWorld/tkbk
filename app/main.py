@@ -100,12 +100,15 @@ def _get_worker_stats():
 
 def _random_delay_seconds(delay_min: int, delay_max: int) -> int:
     delay_min = max(0, _safe_int(delay_min, BATCH_DELAY_MIN, min_value=0))
-    delay_max = max(delay_min, _safe_int(delay_max, BATCH_DELAY_MAX, min_value=0))
-    return random.randint(delay_min, delay_max) if delay_max > 0 else 0
+    delay_max = max(delay_min, _safe_int(delay_max, BATCH_DELAY_MAX, min_value=delay_min))
+    if delay_max <= delay_min:
+        return delay_min
+    return random.randint(delay_min, delay_max)
 
 
 def _sleep_with_cancel_check(task_id: str, seconds: int) -> bool:
-    for _ in range(max(0, seconds)):
+    seconds = max(0, int(seconds))
+    for _ in range(seconds):
         task = task_store.get_task_ref(task_id)
         if not task or task.get("status") == "cancelled":
             return False
@@ -113,52 +116,16 @@ def _sleep_with_cancel_check(task_id: str, seconds: int) -> bool:
     return True
 
 
-# ==================== Worker 生命周期 ====================
+# ==================== Worker 管理 ====================
 
-def _start_workers(count: int):
-    global _worker_threads
-    with _worker_lock:
-        for i in range(count):
-            worker = threading.Thread(
-                target=_book_worker_loop,
-                args=(_worker_generation,),
-                name=f"book-worker-g{_worker_generation}-{i+1}",
-                daemon=True
-            )
-            worker.start()
-            _worker_threads.append(worker)
+def _worker_loop(worker_generation: int, worker_index: int):
+    thread_name = threading.current_thread().name
+    logger.info(f"[{thread_name}] Worker启动，generation={worker_generation}, index={worker_index}")
 
-        logger.info(f"Worker池启动完成: generation={_worker_generation}, count={count}")
-
-
-def _rebuild_workers(new_size: int):
-    global DEFAULT_THREAD_POOL_SIZE, _worker_generation, _worker_threads
-
-    new_size = max(1, _safe_int(new_size, DEFAULT_THREAD_POOL_SIZE, min_value=1, max_value=100))
-
-    with _worker_lock:
-        DEFAULT_THREAD_POOL_SIZE = new_size
-        _worker_generation += 1
-        _worker_threads = []
-
-        logger.info(f"重建Worker池: generation={_worker_generation}, new_size={new_size}")
-        _start_workers(new_size)
-
-
-def _ensure_workers():
-    with _worker_lock:
-        if any(t.is_alive() for t in _worker_threads):
-            return
-    _rebuild_workers(DEFAULT_THREAD_POOL_SIZE)
-
-
-def _book_worker_loop(local_generation: int):
-    logger.info(f"[{threading.current_thread().name}] 启动 generation={local_generation}")
     while True:
-        # 如果 generation 变化，说明 worker 池已重建，当前 worker 退出
         with _worker_lock:
-            if local_generation != _worker_generation:
-                logger.info(f"[{threading.current_thread().name}] generation过期，退出")
+            if worker_generation != _worker_generation:
+                logger.info(f"[{thread_name}] Worker退出：generation已变更 {worker_generation} -> {_worker_generation}")
                 return
 
         try:
@@ -167,15 +134,20 @@ def _book_worker_loop(local_generation: int):
             continue
 
         try:
-            task_id = item["task_id"]
-            file_idx = item["file_idx"]
+            task_id = item.get("task_id")
+            file_idx = item.get("file_idx")
 
-            task = task_store.get_task(task_id)
+            task = task_store.get_task_ref(task_id)
             if not task:
                 _book_queue.task_done()
                 continue
 
-            file_info = task["files"][file_idx]
+            files = task.get("files", [])
+            if not (0 <= file_idx < len(files)):
+                _book_queue.task_done()
+                continue
+
+            file_info = files[file_idx]
             fingerprint = file_info.get("fingerprint")
 
             if task.get("status") == "cancelled":
@@ -189,7 +161,7 @@ def _book_worker_loop(local_generation: int):
             _set_dedup_status(fingerprint, task_id, file_info.get("file_name", ""), "processing")
 
             logger.info(
-                f"[{threading.current_thread().name}] 开始处理 "
+                f"[{thread_name}] 开始处理 "
                 f"task={task_id} file_idx={file_idx} file={file_info.get('file_name')} "
                 f"config_id={file_info.get('config_id')!r} config_name={file_info.get('config_name')!r}"
             )
@@ -198,9 +170,38 @@ def _book_worker_loop(local_generation: int):
             _update_task_status_if_finished(task_id)
 
         except Exception as e:
-            logger.error(f"[{threading.current_thread().name}] 处理书籍任务异常: {e}", exc_info=True)
+            logger.error(f"[{thread_name}] 处理书籍任务异常: {e}", exc_info=True)
         finally:
             _book_queue.task_done()
+
+
+def _rebuild_workers(target_size: int):
+    global _worker_threads, _worker_generation
+
+    target_size = _safe_int(target_size, DEFAULT_THREAD_POOL_SIZE, min_value=1, max_value=100)
+
+    with _worker_lock:
+        _worker_generation += 1
+        current_generation = _worker_generation
+        _worker_threads = []
+
+        for i in range(target_size):
+            t = threading.Thread(
+                target=_worker_loop,
+                args=(current_generation, i),
+                daemon=True,
+                name=f"book-worker-{current_generation}-{i + 1}"
+            )
+            _worker_threads.append(t)
+            t.start()
+
+    logger.info(f"Worker池已重建：size={target_size}, generation={current_generation}")
+
+
+def _ensure_workers():
+    stats = _get_worker_stats()
+    if stats["aliveWorkers"] != DEFAULT_THREAD_POOL_SIZE:
+        _rebuild_workers(DEFAULT_THREAD_POOL_SIZE)
 
 
 # ==================== 去重索引 ====================
@@ -209,7 +210,8 @@ def _build_book_fingerprint(file_name: str, chapters: list, config_id: str, batc
     chapter_digest_parts = []
     for ch in chapters:
         title = ch.get("title", "")
-        content = ch.get("content", "")
+        raw_slice = ch.get("raw_slice", "")
+        content = raw_slice or ch.get("content", "")
         chapter_digest_parts.append(f"{title}\n{_sha256_text(content)}")
 
     payload = {
@@ -361,59 +363,44 @@ def _build_messages(system_prompt: str, history: list, user_message: str, contex
 
 # ==================== 章节解析 ====================
 
-_CHAPTER_SPECIAL_TITLES = {
-    "序章", "序", "楔子", "引子", "前言", "正文",
-    "终章", "尾声", "后记", "番外", "番外篇", "完结感言"
-}
-
-_STRONG_CHAPTER_PATTERNS = [
-    r'^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s*(?:[：:·\-—.．、]\s*.*)?$',
-    r'^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s+.*$',
-    r'^chapter\s*\d+\s*(?:[:：.\-—]\s*.*)?$',
-    r'^chapter\s*[ivxlcdm]+\s*(?:[:：.\-—]\s*.*)?$',
-]
-
-_WEAK_CHAPTER_PATTERNS = [
-    r'^\d+\s*[、.．\-—]\s*.+$',
-    r'^\d+\s+.+$',
-]
-
-
 def _normalize_chapter_line(line: str) -> str:
     if line is None:
         return ""
-    line = line.replace("\ufeff", "").replace("\u3000", " ")
-    line = line.strip()
-    line = re.sub(r"\s+", " ", line)
-    return line
+    line = str(line).replace("\ufeff", "")
+    line = line.replace("\u3000", " ")
+    line = re.sub(r"[ \t]+", " ", line)
+    return line.strip()
 
 
-def _is_special_chapter_title(line: str) -> bool:
-    return _normalize_chapter_line(line) in _CHAPTER_SPECIAL_TITLES
-
-
-def _is_strong_chapter_title(line: str) -> bool:
-    normalized = _normalize_chapter_line(line)
+def _is_strong_chapter_title(normalized: str) -> bool:
     if not normalized:
         return False
-    if _is_special_chapter_title(normalized):
-        return True
-    if len(normalized) > 80:
-        return False
-    for pattern in _STRONG_CHAPTER_PATTERNS:
-        if re.match(pattern, normalized, re.IGNORECASE):
+
+    patterns = [
+        r"^第\s*[0-9零一二三四五六七八九十百千万两〇]+
+           \s*[章回卷节集部篇册幕季]
+           (?:\s*[:：\-—\.、]\s*.*)?$",
+        r"^(序章|楔子|引子|终章|尾声|后记|番外|附录|卷首语|卷尾语)$",
+        r"^(序章|楔子|引子|终章|尾声|后记|番外|附录|卷首语|卷尾语)
+           \s*[:：\-—\.、]\s*.*$",
+    ]
+
+    for p in patterns:
+        if re.match(p, normalized, re.IGNORECASE | re.VERBOSE):
             return True
     return False
 
 
-def _is_weak_chapter_title(line: str) -> bool:
-    normalized = _normalize_chapter_line(line)
+def _is_weak_chapter_title(normalized: str) -> bool:
     if not normalized:
         return False
-    if len(normalized) > 60:
-        return False
-    for pattern in _WEAK_CHAPTER_PATTERNS:
-        if re.match(pattern, normalized, re.IGNORECASE):
+
+    patterns = [
+        r"^\d+\s*[、.．\-—]\s*.+$",
+        r"^\d+\s+.+$",
+    ]
+    for p in patterns:
+        if re.match(p, normalized, re.IGNORECASE):
             return True
     return False
 
@@ -476,44 +463,47 @@ def _parse_chapters(content: str) -> list:
     if not content:
         return []
 
-    lines = content.splitlines()
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized_content.split("\n")
     strong_count, weak_count = _count_chapter_signal_lines(lines)
 
     chapters = []
-    current_chapter = None
-    current_lines = []
+    current_title = None
+    current_start_line = None
 
     for idx, raw_line in enumerate(lines):
         stripped = _normalize_chapter_line(raw_line)
-
         if not stripped:
-            if current_chapter is not None:
-                current_lines.append(raw_line)
             continue
 
         if _is_chapter_title_with_context(lines, idx, strong_count, weak_count):
-            if current_chapter is not None:
-                chapter_text = "\n".join(current_lines).strip()
-                if chapter_text:
-                    chapters.append({
-                        "title": current_chapter,
-                        "content": chapter_text,
-                        "index": len(chapters) + 1
-                    })
-            current_chapter = stripped
-            current_lines = []
-        else:
-            if current_chapter is not None:
-                current_lines.append(raw_line)
+            if current_title is not None and current_start_line is not None:
+                end_line = idx
+                chapter_lines = lines[current_start_line:end_line]
+                chapter_text = "\n".join(chapter_lines).strip("\n")
+                chapters.append({
+                    "title": current_title,
+                    "content": chapter_text,
+                    "raw_slice": chapter_text,
+                    "index": len(chapters) + 1,
+                    "start_line": current_start_line,
+                    "end_line": end_line,
+                })
 
-    if current_chapter is not None:
-        chapter_text = "\n".join(current_lines).strip()
-        if chapter_text:
-            chapters.append({
-                "title": current_chapter,
-                "content": chapter_text,
-                "index": len(chapters) + 1
-            })
+            current_title = stripped
+            current_start_line = idx
+
+    if current_title is not None and current_start_line is not None:
+        chapter_lines = lines[current_start_line:]
+        chapter_text = "\n".join(chapter_lines).strip("\n")
+        chapters.append({
+            "title": current_title,
+            "content": chapter_text,
+            "raw_slice": chapter_text,
+            "index": len(chapters) + 1,
+            "start_line": current_start_line,
+            "end_line": len(lines),
+        })
 
     return chapters
 
@@ -530,6 +520,28 @@ def _slice_chapters(chapters: list, start_chapter: int = None, end_chapter: int 
 
     selected = chapters[start - 1:end]
     return selected, start, end
+
+
+def _build_batch_content_from_raw_lines(raw_lines: list, all_selected_chapters: list, batch_start: int, batch_end: int) -> str:
+    if not all_selected_chapters or batch_start >= batch_end:
+        return ""
+
+    batch_chapters = all_selected_chapters[batch_start:batch_end]
+    if not batch_chapters:
+        return ""
+
+    start_line = _safe_int(batch_chapters[0].get("start_line", 0), 0, min_value=0, max_value=len(raw_lines))
+
+    if batch_end < len(all_selected_chapters):
+        next_start_line = _safe_int(all_selected_chapters[batch_end].get("start_line", len(raw_lines)), len(raw_lines), min_value=0, max_value=len(raw_lines))
+        end_line = next_start_line
+    else:
+        end_line = len(raw_lines)
+
+    if end_line < start_line:
+        end_line = start_line
+
+    return "\n".join(raw_lines[start_line:end_line]).strip("\n")
 
 
 # ==================== 任务 / 文件状态辅助 ====================
@@ -666,6 +678,8 @@ def _process_single_book(task_id: str, file_idx: int):
     delay_min = _safe_int(file_info.get("delay_min", BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
     delay_max = _safe_int(file_info.get("delay_max", BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=delay_min)
     file_name = file_info.get("file_name", "未命名")
+    raw_content = file_info.get("raw_content", "") or ""
+    raw_lines = raw_content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
     if not chapters:
         _mark_file_terminal(task_id, file_idx, "failed", "没有可处理章节")
@@ -719,12 +733,18 @@ def _process_single_book(task_id: str, file_idx: int):
             batch_num = batch_index + 1
             batch_chapters = chapters[batch_start:batch_end]
 
-            batch_content_parts = []
-            for ch in batch_chapters:
-                title = ch.get("title", "未命名章节")
-                content = ch.get("content", "")
-                batch_content_parts.append(f"\n\n=== {title} ===\n\n{content}")
-            batch_content = "".join(batch_content_parts)
+            batch_content = _build_batch_content_from_raw_lines(
+                raw_lines=raw_lines,
+                all_selected_chapters=chapters,
+                batch_start=batch_start,
+                batch_end=batch_end
+            )
+
+            if not batch_content.strip():
+                logger.warning(
+                    f"[{task_id}] [{file_name}] 批次 {batch_num}/{total_batches} 内容为空，"
+                    f"章节 {batch_start + 1}-{batch_end}"
+                )
 
             if user_prompt_template:
                 user_message = user_prompt_template.replace("{content}", batch_content)
@@ -736,7 +756,11 @@ def _process_single_book(task_id: str, file_idx: int):
             messages.extend(recent_context)
             messages.append({"role": "user", "content": user_message})
 
-            logger.info(f"[{task_id}] [{file_name}] 处理批次 {batch_num}/{total_batches}，章节 {batch_start + 1}-{batch_end}")
+            logger.info(
+                f"[{task_id}] [{file_name}] 处理批次 {batch_num}/{total_batches}，"
+                f"章节 {batch_start + 1}-{batch_end}，"
+                f"batch_content_len={len(batch_content)}"
+            )
 
             success, result = _call_llm_batch_with_retry(
                 config=config,
@@ -922,74 +946,87 @@ def register_routes(app):
 
     @app.route('/api/settings', methods=['GET'])
     def get_settings():
-        settings = app_settings_service.get_default_runtime_config()
-        settings['batchDelayMin'] = BATCH_DELAY_MIN
-        settings['batchDelayMax'] = BATCH_DELAY_MAX
-        return jsonify({
-            'success': True,
-            'settings': settings
-        })
+        data = app_settings_service.get_all_safe()
+        data.update(_get_worker_stats())
+        data["threadPoolSize"] = DEFAULT_THREAD_POOL_SIZE
+        data["maxConcurrent"] = MAX_CONCURRENT_TASKS
+        return jsonify({'success': True, 'settings': data})
 
-    @app.route('/api/settings/update', methods=['POST'])
-    def update_settings():
+    @app.route('/api/settings', methods=['POST'])
+    def save_settings():
         data = request.json or {}
-        result = app_settings_service.update_user_defaults(data)
-        status_code = 200 if result.get("success") else 400
-        return jsonify(result), status_code
-
-    @app.route('/api/set-concurrent', methods=['POST'])
-    def set_concurrent():
-        global MAX_CONCURRENT_TASKS
-        data = request.json or {}
-        value = _safe_int(data.get('maxConcurrent', 10), 10, min_value=1, max_value=50)
-        MAX_CONCURRENT_TASKS = value
-        logger.info(f"maxConcurrent 调整为: {value}")
-        return jsonify({'success': True, 'maxConcurrent': value})
+        result = app_settings_service.save_settings(data)
+        return jsonify(result)
 
     @app.route('/api/set-thread-pool', methods=['POST'])
     def set_thread_pool():
+        global DEFAULT_THREAD_POOL_SIZE, MAX_CONCURRENT_TASKS
         data = request.json or {}
-        value = _safe_int(data.get('threadPoolSize', 10), 10, min_value=1, max_value=100)
 
-        # 关键修复：真正重建 worker 池，支持从10缩到3
-        _rebuild_workers(value)
+        new_thread_pool = _safe_int(
+            data.get('threadPoolSize', DEFAULT_THREAD_POOL_SIZE),
+            DEFAULT_THREAD_POOL_SIZE,
+            min_value=1,
+            max_value=100
+        )
+        new_max_concurrent = _safe_int(
+            data.get('maxConcurrent', MAX_CONCURRENT_TASKS),
+            MAX_CONCURRENT_TASKS,
+            min_value=1,
+            max_value=100
+        )
 
-        logger.info(f"工作线程数调整为: {value}（已重建worker池）")
-        return jsonify({'success': True, 'threadPoolSize': value})
+        DEFAULT_THREAD_POOL_SIZE = new_thread_pool
+        MAX_CONCURRENT_TASKS = new_max_concurrent
 
-    @app.route('/api/set-batch-delay', methods=['POST'])
-    def set_batch_delay():
-        global BATCH_DELAY_MIN, BATCH_DELAY_MAX
-        data = request.json or {}
-        min_val = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
-        max_val = _safe_int(data.get('delayMax', BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=min_val)
-        BATCH_DELAY_MIN = min_val
-        BATCH_DELAY_MAX = max_val
-        logger.info(f"批次延迟调整为: {min_val}-{max_val} 秒")
+        _rebuild_workers(DEFAULT_THREAD_POOL_SIZE)
+
+        logger.info(
+            f"线程池设置更新：threadPoolSize={DEFAULT_THREAD_POOL_SIZE}, "
+            f"maxConcurrent={MAX_CONCURRENT_TASKS}"
+        )
+
         return jsonify({
             'success': True,
-            'batchDelayMin': BATCH_DELAY_MIN,
-            'batchDelayMax': BATCH_DELAY_MAX
-        })
-
-    @app.route('/api/status', methods=['GET'])
-    def get_status():
-        worker_stats = _get_worker_stats()
-        return jsonify({
-            'success': True,
-            'maxConcurrent': MAX_CONCURRENT_TASKS,
             'threadPoolSize': DEFAULT_THREAD_POOL_SIZE,
-            'batchSize': DEFAULT_BATCH_SIZE,
-            'batchDelayMin': BATCH_DELAY_MIN,
-            'batchDelayMax': BATCH_DELAY_MAX,
-            'taskCount': task_store.task_count(),
-            'queueSize': worker_stats['queueSize'],
-            'aliveWorkers': worker_stats['aliveWorkers'],
-            'generation': worker_stats['generation'],
+            'maxConcurrent': MAX_CONCURRENT_TASKS,
+            **_get_worker_stats()
         })
 
-    @app.route('/api/config/list', methods=['GET'])
-    def list_configs():
+    @app.route('/api/conversations', methods=['GET'])
+    def get_conversations():
+        user_id = request.args.get('userId', 'default')
+        conversations = conversation_store.get_conversations(user_id)
+        return jsonify({'success': True, 'conversations': conversations})
+
+    @app.route('/api/conversation/new', methods=['POST'])
+    def create_conversation():
+        data = request.json or {}
+        user_id = data.get('userId', 'default')
+        title = data.get('title', '新对话')
+        conv = conversation_store.create_conversation(user_id, title)
+        return jsonify({'success': True, 'conversation': conv})
+
+    @app.route('/api/conversation/<conv_id>', methods=['GET'])
+    def get_conversation(conv_id):
+        user_id = request.args.get('userId', 'default')
+        conv = conversation_store.get_conversation(user_id, conv_id)
+        if not conv:
+            return jsonify({'success': False, 'error': '对话不存在'}), 404
+        return jsonify({'success': True, 'conversation': conv})
+
+    @app.route('/api/conversation/delete', methods=['POST'])
+    def delete_conversation():
+        data = request.json or {}
+        user_id = data.get('userId', 'default')
+        conv_id = data.get('conversationId')
+        if not conv_id:
+            return jsonify({'success': False, 'error': '缺少conversationId'}), 400
+        ok = conversation_store.delete_conversation(user_id, conv_id)
+        return jsonify({'success': ok})
+
+    @app.route('/api/configs', methods=['GET'])
+    def get_configs():
         user_id = request.args.get('userId', 'default')
         configs = conversation_config_store.get_user_configs_safe(user_id)
         return jsonify({'success': True, 'configs': configs})
@@ -998,78 +1035,25 @@ def register_routes(app):
     def save_config():
         data = request.json or {}
         user_id = data.get('userId', 'default')
-        config_id = data.get('id') or str(uuid.uuid4())
-        config_data = {
-            "name": data.get('name', '未命名配置'),
-            "systemPrompt": data.get('systemPrompt', ''),
-            "batchSystemPrompt": data.get('batchSystemPrompt', ''),
-            "batchUserPromptTemplate": data.get('batchUserPromptTemplate', ''),
-            "batchSize": data.get('batchSize', ''),
-            "model": data.get('model', ''),
-            "temperature": data.get('temperature', ''),
-            "topP": data.get('topP', ''),
-            "contextRounds": data.get('contextRounds', ''),
-            "maxOutputTokens": data.get('maxOutputTokens', ''),
-            "apiHost": data.get('apiHost', ''),
-            "apiKey": data.get('apiKey', ''),
-            "hfToken": data.get('hfToken', ''),
-            "hfDataset": data.get('hfDataset', ''),
-        }
-        logger.info(
-            f"保存配置: id={config_id}, name={config_data.get('name')!r}, "
-            f"batchSystemPrompt_len={len(config_data.get('batchSystemPrompt') or '')}, "
-            f"systemPrompt_len={len(config_data.get('systemPrompt') or '')}"
-        )
-        conversation_config_store.save_config(user_id, config_id, config_data)
-        return jsonify({'success': True, 'id': config_id})
+        result = conversation_config_store.save_config(user_id, data)
+        return jsonify(result)
 
     @app.route('/api/config/delete', methods=['POST'])
     def delete_config():
         data = request.json or {}
         user_id = data.get('userId', 'default')
-        config_id = data.get('id')
+        config_id = data.get('configId')
         if not config_id:
-            return jsonify({'success': False, 'error': '缺少配置ID'}), 400
-        conversation_config_store.delete_config(user_id, config_id)
-        return jsonify({'success': True})
-
-    @app.route('/api/conversations', methods=['GET'])
-    def get_conversations():
-        user_id = request.args.get('userId', 'default')
-        convs = conversation_store.get_user_conversations(user_id)
-        return jsonify({'success': True, 'conversations': convs})
-
-    @app.route('/api/conversation/create', methods=['POST'])
-    def create_conversation():
-        data = request.json or {}
-        user_id = data.get('userId', 'default')
-        conv_id = str(uuid.uuid4())
-        conv_data = {
-            'id': conv_id,
-            'title': data.get('title', '新对话'),
-            'configId': data.get('configId', ''),
-            'created_at': int(time.time() * 1000),
-            'messages': []
-        }
-        conversation_store.create_conversation(user_id, conv_id, conv_data)
-        return jsonify({'success': True, 'conversation': conv_data})
-
-    @app.route('/api/conversation/delete', methods=['POST'])
-    def delete_conversation():
-        data = request.json or {}
-        user_id = data.get('userId', 'default')
-        conv_id = data.get('id')
-        if not conv_id:
-            return jsonify({'success': False, 'error': '缺少对话ID'}), 400
-        conversation_store.delete_conversation(user_id, conv_id)
-        return jsonify({'success': True})
+            return jsonify({'success': False, 'error': '缺少configId'}), 400
+        result = conversation_config_store.delete_config(user_id, config_id)
+        return jsonify(result)
 
     @app.route('/api/chat', methods=['POST'])
     def chat():
         data = request.json or {}
         user_id = data.get('userId', 'default')
         conv_id = data.get('conversationId')
-        user_message = (data.get('message', '') or '').strip()
+        user_message = data.get('message', '')
         config_id = data.get('configId', '')
 
         if not conv_id:
@@ -1131,6 +1115,10 @@ def register_routes(app):
             if not chapters:
                 continue
 
+            raw_content = f.get('content', '') or f.get('rawContent', '') or ''
+            if not raw_content:
+                logger.warning(f"[submit_batch] 文件={f.get('fileName')} 未携带原始content，批次切片可能不准确")
+
             config_id = f.get('configId', '')
             config_name = f.get('configName', '默认配置')
             file_batch_size = _safe_int(f.get('batchSize', batch_size), batch_size, min_value=1)
@@ -1190,6 +1178,7 @@ def register_routes(app):
                 "config_id": config_id,
                 "config_name": config_name,
                 "chapters": selected_chapters,
+                "raw_content": raw_content,
                 "batch_size": file_batch_size,
                 "delay_min": delay_min,
                 "delay_max": delay_max,
@@ -1338,13 +1327,13 @@ def register_routes(app):
 
         f = files[file_idx]
         file_name = f.get('file_name', '未命名')
-        safe_name = _sanitize_filename(file_name)
 
-        text_parts = []
-        text_parts.append(f"小说: {file_name}")
-        text_parts.append(f"任务ID: {task_id}")
-        text_parts.append(f"处理时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        text_parts.append(f"{'='*60}\n")
+        text_parts = [
+            f"小说: {file_name}",
+            f"任务ID: {task_id}",
+            f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"{'='*60}\n"
+        ]
 
         for r in f.get("results", []):
             batch_num = r.get('batch', '?')
@@ -1358,43 +1347,33 @@ def register_routes(app):
             text_parts.append("\n")
 
         content = '\n'.join(text_parts)
+        safe_name = _sanitize_filename(file_name)
         return jsonify({'success': True, 'content': content, 'filename': f"{safe_name}-节奏.txt"})
 
-    @app.route('/api/hf-action', methods=['POST'])
+    @app.route('/api/hf/action', methods=['POST'])
     def hf_action():
         data = request.json or {}
         result = file_service.hf_action(data)
-        status_code = 200 if result.get('success') else 400
-        return jsonify(result), status_code
+        return jsonify(result)
 
-    @app.route('/api/hf-files', methods=['GET'])
+    @app.route('/api/hf/files', methods=['GET'])
     def hf_files():
         hf_token = request.args.get('hfToken', '')
         hf_dataset = request.args.get('hfDataset', '')
         files = file_service.list_dataset_files(hf_token, hf_dataset)
         return jsonify({'success': True, 'files': files})
 
-    @app.route('/api/hf-download', methods=['POST'])
-    def hf_download():
-        data = request.json or {}
-        hf_token = data.get('hfToken', '')
-        hf_dataset = data.get('hfDataset', '')
-        filename = data.get('filename', '')
-        if not filename:
-            return jsonify({'success': False, 'error': '缺少文件名'}), 400
-        result = file_service.download_dataset_file(hf_token, hf_dataset, filename)
-        status_code = 200 if result.get('success') else 400
-        return jsonify(result), status_code
+    @app.route('/api/hf/result-files', methods=['GET'])
+    def hf_result_files():
+        hf_token = request.args.get('hfToken', '')
+        hf_dataset = request.args.get('hfDataset', '')
+        files = file_service.list_result_files(hf_token, hf_dataset)
+        return jsonify({'success': True, 'files': files})
 
-    @app.route('/api/hf-create-dataset', methods=['POST'])
-    def hf_create_dataset():
-        data = request.json or {}
-        hf_token = data.get('hfToken', '')
-        dataset_name = data.get('datasetName', '')
-        if not hf_token or not dataset_name:
-            return jsonify({'success': False, 'error': '需要 HF Token 和数据集名称'}), 400
-        from app.services.hf_dataset_service import hf_dataset_service
-        success = hf_dataset_service.create_dataset(hf_token, dataset_name, private=True)
-        if success:
-            return jsonify({'success': True, 'message': f'数据集 {dataset_name} 已创建 (private)'})
-        return jsonify({'success': False, 'error': '创建失败'})
+    @app.route('/api/hf/download', methods=['GET'])
+    def hf_download():
+        hf_token = request.args.get('hfToken', '')
+        hf_dataset = request.args.get('hfDataset', '')
+        filename = request.args.get('filename', '')
+        result = file_service.download_dataset_file(hf_token, hf_dataset, filename)
+        return jsonify(result)
