@@ -20,9 +20,9 @@ from app.services.app_settings_service import app_settings_service
 logger = logging.getLogger(__name__)
 
 # 全局配置
-DEFAULT_THREAD_POOL_SIZE = 10       # 工作线程数：同时最多处理多少本书
-DEFAULT_BATCH_SIZE = 10             # 默认每批次10章
-MAX_CONCURRENT_TASKS = 10           # 兼容保留，实际以工作线程池并发为主
+DEFAULT_THREAD_POOL_SIZE = 10
+DEFAULT_BATCH_SIZE = 10
+MAX_CONCURRENT_TASKS = 10
 BATCH_DELAY_MIN = 15
 BATCH_DELAY_MAX = 45
 
@@ -35,8 +35,6 @@ _worker_threads = []
 _worker_lock = threading.RLock()
 _worker_stop_event = threading.Event()
 
-# 去重索引：fingerprint -> metadata
-# metadata: {"task_id": ..., "file_name": ..., "status": queued/processing}
 _book_dedup_index = {}
 _book_dedup_lock = threading.RLock()
 
@@ -161,7 +159,6 @@ def _book_worker_loop():
             file_info = task["files"][file_idx]
             fingerprint = file_info.get("fingerprint")
 
-            # 任务已取消，跳过
             if task.get("status") == "cancelled":
                 _mark_file_terminal(task_id, file_idx, "cancelled", "任务已取消")
                 _release_dedup_if_terminal(fingerprint, "cancelled")
@@ -169,14 +166,12 @@ def _book_worker_loop():
                 _book_queue.task_done()
                 continue
 
-            # 标记处理中
             _mark_file_processing(task_id, file_idx)
             _set_dedup_status(fingerprint, task_id, file_info.get("file_name", ""), "processing")
 
             logger.info(f"[{threading.current_thread().name}] 开始处理 task={task_id} file_idx={file_idx} file={file_info.get('file_name')}")
             _process_single_book(task_id, file_idx)
 
-            # 单本结束后更新任务聚合状态
             _update_task_status_if_finished(task_id)
 
         except Exception as e:
@@ -656,8 +651,26 @@ def _process_single_book(task_id: str, file_idx: int):
         _update_task_status_if_finished(task_id)
         return
 
-    system_prompt = config.get("batchSystemPrompt", config.get("systemPrompt", "You are a helpful AI assistant."))
-    user_prompt_template = config.get("batchUserPromptTemplate", "")
+    # ==================== 这里是关键修复 ====================
+    system_prompt = (
+        config.get("batchSystemPrompt")
+        or config.get("systemPrompt")
+        or "You are a helpful AI assistant."
+    )
+    user_prompt_template = config.get("batchUserPromptTemplate") or ""
+
+    logger.info(
+        f"[{task_id}] [{file_name}] prompt检查: "
+        f"batchSystemPrompt_len={len(config.get('batchSystemPrompt') or '')}, "
+        f"systemPrompt_len={len(config.get('systemPrompt') or '')}, "
+        f"batchUserPromptTemplate_len={len(config.get('batchUserPromptTemplate') or '')}"
+    )
+    logger.info(
+        f"[{task_id}] [{file_name}] 实际使用system_prompt前120字符: "
+        f"{repr(system_prompt[:120])}"
+    )
+    # ======================================================
+
     context_messages = []
 
     total_chapters = len(chapters)
@@ -751,7 +764,6 @@ def _process_single_book(task_id: str, file_idx: int):
                 })
                 _update_task_aggregate_progress(task_id)
 
-        # 单本完成后上传
         _upload_single_novel_result(task_id, file_idx)
         current_task = task_store.get_task_ref(task_id)
         if current_task and current_task.get("status") != "cancelled":
@@ -858,8 +870,6 @@ def register_routes(app):
             'queueSize': worker_stats['queueSize'],
         })
 
-    # ==================== 设置 ====================
-
     @app.route('/api/settings', methods=['GET'])
     def get_settings():
         settings = app_settings_service.get_default_runtime_config()
@@ -873,8 +883,9 @@ def register_routes(app):
     @app.route('/api/settings/update', methods=['POST'])
     def update_settings():
         data = request.json or {}
-        app_settings_service.update_user_defaults(data)
-        return jsonify({'success': True, 'settings': app_settings_service.get_default_runtime_config()})
+        result = app_settings_service.update_user_defaults(data)
+        status_code = 200 if result.get("success") else 400
+        return jsonify(result), status_code
 
     @app.route('/api/set-concurrent', methods=['POST'])
     def set_concurrent():
@@ -923,8 +934,6 @@ def register_routes(app):
             'aliveWorkers': worker_stats['aliveWorkers'],
         })
 
-    # ==================== 配置管理 ====================
-
     @app.route('/api/config/list', methods=['GET'])
     def list_configs():
         user_id = request.args.get('userId', 'default')
@@ -965,8 +974,6 @@ def register_routes(app):
         conversation_config_store.delete_config(user_id, config_id)
         return jsonify({'success': True})
 
-    # ==================== 聊天 ====================
-
     @app.route('/api/conversations', methods=['GET'])
     def get_conversations():
         user_id = request.args.get('userId', 'default')
@@ -1003,14 +1010,16 @@ def register_routes(app):
         data = request.json or {}
         user_id = data.get('userId', 'default')
         conv_id = data.get('conversationId')
-        user_message = data.get('message', '').strip()
+        user_message = (data.get('message', '') or '').strip()
         config_id = data.get('configId', '')
 
+        if not conv_id:
+            return jsonify({'success': False, 'error': '缺少conversationId'}), 400
         if not user_message:
             return jsonify({'success': False, 'error': '消息不能为空'}), 400
 
         config = app_settings_service.resolve_config_from_id(user_id, config_id)
-        system_prompt = config.get('systemPrompt', '')
+        system_prompt = config.get('systemPrompt') or ''
         context_rounds = _safe_int(config.get('contextRounds', 100), 100, min_value=0)
 
         user_msg = {'role': 'user', 'content': user_message, 'time': int(time.time() * 1000)}
@@ -1029,8 +1038,6 @@ def register_routes(app):
             return jsonify({'success': True, 'message': assistant_message})
         else:
             return jsonify({'success': False, 'error': result})
-
-    # ==================== 批处理 ====================
 
     @app.route('/api/parse-chapters', methods=['POST'])
     def parse_chapters():
@@ -1198,8 +1205,6 @@ def register_routes(app):
             'error': '当前重构版本暂未开放 resume，请重新提交需要重跑的章节范围'
         }), 400
 
-    # ==================== 任务管理 ====================
-
     @app.route('/api/tasks', methods=['GET'])
     def get_tasks():
         summary = task_store.get_all_tasks_summary()
@@ -1281,8 +1286,6 @@ def register_routes(app):
 
         content = '\n'.join(text_parts)
         return jsonify({'success': True, 'content': content, 'filename': f"{safe_name}-节奏.txt"})
-
-    # ==================== HF 数据集 ====================
 
     @app.route('/api/hf-action', methods=['POST'])
     def hf_action():
