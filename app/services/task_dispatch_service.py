@@ -512,7 +512,7 @@ class TaskDispatchService:
 
                 started_at = time.time()
                 messages = self._build_batch_messages(resolved_config, batch_content)
-batch_system_prompt = (
+                batch_system_prompt = (
                     resolved_config.get("batchSystemPrompt")
                     or resolved_config.get("systemPrompt")
                     or ""
