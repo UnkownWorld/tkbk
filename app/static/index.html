@@ -198,6 +198,70 @@
             .task-item { flex-direction: column; align-items: flex-start; gap: 8px; }
             .task-actions { width: 100%; justify-content: flex-end; }
         }
+
+        /* 批处理进度条 */
+        .progress-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 4000;
+        }
+        .progress-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 24px 32px;
+            min-width: 400px;
+            max-width: 600px;
+        }
+        .progress-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+        .progress-bar-container {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 12px;
+        }
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--success));
+            border-radius: 4px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        .progress-text {
+            text-align: center;
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+        .progress-files {
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 13px;
+        }
+        .progress-file {
+            padding: 6px 10px;
+            background: rgba(34,197,94,0.1);
+            border-radius: 6px;
+            margin-bottom: 4px;
+            color: var(--success);
+        }
+        .progress-file.error {
+            background: rgba(239,68,68,0.1);
+            color: var(--error);
+        }
     </style>
 </head>
 

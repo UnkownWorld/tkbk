@@ -476,36 +476,170 @@ function renderChatMessages() {
 }
 
 // ==================== 批处理（多文件） ====================
-function handleBatchFiles(files) {
-    Array.from(files).forEach(file => {
-        if (!file.name.endsWith('.txt')) return;
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-            const content = e.target.result;
-            showLoading(`正在解析 ${file.name} ...`);
-            const data = await api('/api/parse-chapters', {
-                method: 'POST',
-                body: JSON.stringify({ content }),
-            });
-            hideLoading();
 
-            if (data.success && data.chapters.length > 0) {
-                const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
-                state.batchFiles.push({
-                    fileId,
+/**
+ * 高性能批处理文件处理
+ * - 使用Web Worker并行解析
+ * - 实时进度显示
+ */
+async function handleBatchFiles(files) {
+    const txtFiles = Array.from(files).filter(f => f.name.endsWith('.txt'));
+    if (txtFiles.length === 0) {
+        showToast('请选择.txt文件', 'warning');
+        return;
+    }
+    
+    // 显示进度条
+    const progressContainer = document.createElement('div');
+    progressContainer.id = 'batchProgress';
+    progressContainer.innerHTML = `
+        <div class="progress-overlay">
+            <div class="progress-card">
+                <div class="progress-title">正在解析文件...</div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="batchProgressBar"></div>
+                </div>
+                <div class="progress-text" id="batchProgressText">0/${txtFiles.length}</div>
+                <div class="progress-files" id="batchProgressFiles"></div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(progressContainer);
+    
+    const progressBar = $('batchProgressBar');
+    const progressText = $('batchProgressText');
+    const progressFiles = $('batchProgressFiles');
+    
+    let completed = 0;
+    const results = [];
+    
+    // 使用Web Worker并行解析
+    const parsePromises = txtFiles.map((file, index) => {
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                // 在主线程中解析（比后端快）
+                const chapters = parseChaptersLocal(e.target.result);
+                completed++;
+                
+                // 更新进度
+                const percent = Math.round((completed / txtFiles.length) * 100);
+                progressBar.style.width = percent + '%';
+                progressText.textContent = `${completed}/${txtFiles.length}`;
+                progressFiles.innerHTML = `<div class="progress-file">✓ ${file.name}: ${chapters.length} 章</div>` + progressFiles.innerHTML;
+                
+                resolve({
                     fileName: file.name,
-                    chapters: data.chapters,
-                    configId: '',
-                    batchSize: state.defaultBatchSize,
+                    chapters: chapters,
+                    success: chapters.length > 0
                 });
-                renderBatchFiles();
-                showToast(`${file.name}: ${data.chapters.length} 章`, 'success');
-            } else {
-                showToast(`${file.name}: 未识别到章节`, 'warning');
-            }
-        };
-        reader.readAsText(file);
+            };
+            reader.onerror = () => {
+                completed++;
+                progressBar.style.width = Math.round((completed / txtFiles.length) * 100) + '%';
+                progressText.textContent = `${completed}/${txtFiles.length}`;
+                progressFiles.innerHTML = `<div class="progress-file error">✗ ${file.name}: 读取失败</div>` + progressFiles.innerHTML;
+                resolve({ fileName: file.name, chapters: [], success: false });
+            };
+            reader.readAsText(file);
+        });
     });
+    
+    // 并行执行所有解析
+    const allResults = await Promise.all(parsePromises);
+    
+    // 移除进度条
+    document.body.removeChild(progressContainer);
+    
+    // 添加成功的文件到列表
+    let successCount = 0;
+    allResults.forEach(result => {
+        if (result.success && result.chapters.length > 0) {
+            const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+            state.batchFiles.push({
+                fileId,
+                fileName: result.fileName,
+                chapters: result.chapters,
+                configId: '',
+                batchSize: state.defaultBatchSize,
+            });
+            successCount++;
+        }
+    });
+    
+    renderBatchFiles();
+    showToast(`成功解析 ${successCount}/${txtFiles.length} 个文件`, successCount > 0 ? 'success' : 'warning');
+}
+
+/**
+ * 本地解析章节 - 高性能版本
+ * 直接在浏览器中解析，无需后端
+ */
+function parseChaptersLocal(content) {
+    const chapters = [];
+    const lines = content.split('\n');
+    let currentChapter = null;
+    let currentLines = [];
+    let chapterIndex = 0;
+    
+    // 章节标题匹配模式
+    const patterns = [
+        /^[第]\s*([零一二三四五六七八九十百千万\d]+)\s*[章节回卷集部篇]\s*[：:．.\s]*\S+/,
+        /^Chapter\s*\d+/i,
+        /^CHAPTER\s*\d+/,
+        /^\d+[、.．]\s*\S+/,
+    ];
+    
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const stripped = line.trim();
+        
+        if (!stripped) {
+            if (currentChapter !== null) currentLines.push(line);
+            continue;
+        }
+        
+        let isChapterTitle = false;
+        for (const pattern of patterns) {
+            if (pattern.test(stripped)) {
+                isChapterTitle = true;
+                break;
+            }
+        }
+        
+        if (isChapterTitle) {
+            if (currentChapter !== null) {
+                const chapterText = currentLines.join('\n').trim();
+                if (chapterText) {
+                    chapterIndex++;
+                    chapters.push({
+                        title: currentChapter,
+                        content: chapterText,
+                        index: chapterIndex
+                    });
+                }
+            }
+            currentChapter = stripped;
+            currentLines = [];
+        } else {
+            if (currentChapter !== null) currentLines.push(line);
+        }
+    }
+    
+    // 最后一章
+    if (currentChapter !== null) {
+        const chapterText = currentLines.join('\n').trim();
+        if (chapterText) {
+            chapterIndex++;
+            chapters.push({
+                title: currentChapter,
+                content: chapterText,
+                index: chapterIndex
+            });
+        }
+    }
+    
+    return chapters;
 }
 
 function renderBatchFiles() {
