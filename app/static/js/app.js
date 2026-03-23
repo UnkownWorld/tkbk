@@ -787,6 +787,12 @@ function buildLocalBatchFileFingerprint(fileName, content) {
 
 function renderBatchSubmitArea() {
     const card = $('batchSubmitArea');
+    const btnSubmit = $('btnSubmitBatch');
+    const btnClear = $('btnClearBatch');
+
+    if (btnSubmit) btnSubmit.disabled = state.batchFiles.length === 0;
+    if (btnClear) btnClear.disabled = state.batchFiles.length === 0;
+
     if (!card) return;
 
     if (!state.batchFiles.length) {
@@ -799,19 +805,13 @@ function renderBatchSubmitArea() {
     }
 
     card.innerHTML = `
-        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;">
-            <div style="font-size:13px;color:var(--text-secondary);">
-                当前待提交：<strong>${state.batchFiles.length}</strong> 本
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <button id="btnClearBatchInner" class="btn btn-secondary">清空列表</button>
-                <button id="btnSubmitBatchInner" class="btn btn-primary">提交批处理</button>
-            </div>
+        <div style="font-size:13px;color:var(--text-secondary);">
+            当前待提交：<strong>${state.batchFiles.length}</strong> 本，
+            总预览章节数：<strong>${
+                state.batchFiles.reduce((sum, f) => sum + Math.max(1, (f.previewChapters || []).length || 1), 0)
+            }</strong>
         </div>
     `;
-
-    safeAddEvent('btnClearBatchInner', 'click', clearBatchFiles);
-    safeAddEvent('btnSubmitBatchInner', 'click', submitBatch);
 }
 
 async function handleBatchFiles(files) {
