@@ -239,6 +239,7 @@ class LLMService:
                 "text": "",
             }
 
+
     def call_with_retry(self, config: dict, messages: list, max_retries: int = 3, delay_min: int = 15, delay_max: int = 45, cancel_check=None):
         max_retries = _safe_int(max_retries, 3, min_value=1, max_value=10)
         delay_min = _safe_int(delay_min, 15, min_value=0)
@@ -247,7 +248,10 @@ class LLMService:
         last = None
 
         for attempt in range(1, max_retries + 1):
-            result = self.call_once(config=config, messages=messages, use_stream=True)
+            # 临时验证方案：批处理改为非流式，排查 stream 链路问题
+            logger.info(f"批处理调用LLM（非流式验证模式）: 第 {attempt}/{max_retries} 次")
+            result = self.call_once(config=config, messages=messages, use_stream=False)
+
             if result["success"]:
                 return result
 
@@ -288,6 +292,6 @@ class LLMService:
             "result": None,
             "text": "",
         }
-
+        
 
 llm_service = LLMService()
