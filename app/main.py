@@ -237,13 +237,29 @@ def register_routes(app):
                 })
 
         messages.append({"role": "user", "content": user_message})
-
+        logger.info(
+            f"[chat] conversationId={conv_id!r}, "
+            f"config_id={config_id!r}, "
+            f"apiHost={resolved_config.get('apiHost')!r}, "
+            f"model={resolved_config.get('model')!r}, "
+            f"systemPrompt_len={len(system_prompt or '')}, "
+            f"user_message_len={len(user_message or '')}"
+        )
         call_result = llm_service.call_once(
             config=resolved_config,
             messages=messages,
             use_stream=False
         )
 
+        logger.info(
+            "[chat] messages_summary=" + str([
+                {
+                    "role": m.get("role"),
+                    "len": len(m.get("content") or "")
+                }
+                for m in messages
+            ])
+        )
         if call_result["success"]:
             assistant_text = call_result.get("text", "")
             assistant_msg = {
