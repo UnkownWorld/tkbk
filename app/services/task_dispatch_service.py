@@ -512,7 +512,32 @@ class TaskDispatchService:
 
                 started_at = time.time()
                 messages = self._build_batch_messages(resolved_config, batch_content)
+batch_system_prompt = (
+                    resolved_config.get("batchSystemPrompt")
+                    or resolved_config.get("systemPrompt")
+                    or ""
+                )
+                batch_user_template = resolved_config.get("batchUserPromptTemplate") or "{content}"
 
+                logger.info(
+                    f"[batch] task={task_id}, file={file_name!r}, batch={batch_index}, "
+                    f"config_id={book_task.get('config_id')!r}, "
+                    f"config_name={book_task.get('config_name')!r}, "
+                    f"apiHost={resolved_config.get('apiHost')!r}, "
+                    f"model={resolved_config.get('model')!r}, "
+                    f"batchSystemPrompt_len={len(batch_system_prompt)}, "
+                    f"batchUserPromptTemplate_len={len(batch_user_template)}, "
+                    f"batch_content_len={len(batch_content or '')}"
+                )
+                logger.info(
+                    "[batch] messages_summary=" + str([
+                        {
+                            "role": m.get("role"),
+                            "len": len(m.get("content") or "")
+                        }
+                        for m in messages
+                    ])
+                )
                 call_result = llm_service.call_with_retry(
                     config=resolved_config,
                     messages=messages,
