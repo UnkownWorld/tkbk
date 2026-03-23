@@ -1,114 +1,98 @@
 import logging
-from huggingface_hub import HfApi, hf_hub_download, create_repo
+from io import BytesIO
+
+import requests
+from huggingface_hub import HfApi, hf_hub_download
 
 logger = logging.getLogger(__name__)
 
 
 class HFDatasetService:
-    def _get_api(self, token: str):
-        """
-        每次按 token 创建独立 HfApi，避免共享状态带来的潜在线程安全问题。
-        """
-        return HfApi(token=token)
+    """
+    最终版 HF Dataset 服务：
+    - 创建数据集
+    - 列文件
+    - 列结果文件
+    - 下载文本
+    - 上传文本
+    - 删除文件
+    """
 
-    def list_files(self, token: str, dataset: str):
-        if not token or not dataset:
-            logger.warning("list_files 缺少 token 或 dataset")
-            return []
+    def __init__(self):
+        self._api = HfApi()
 
+    # ==================== 数据集管理 ====================
+
+    def create_dataset(self, hf_token: str, hf_dataset: str, private: bool = True):
         try:
-            api = self._get_api(token)
-            files = api.list_repo_files(
-                repo_id=dataset,
+            self._api.create_repo(
+                repo_id=hf_dataset,
+                token=hf_token,
                 repo_type="dataset",
-                token=token
+                private=private,
+                exist_ok=True
             )
-            return [f for f in files if not str(f).startswith(".")]
+            return True
         except Exception as e:
-            logger.error(f"列出文件失败 [{dataset}]: {e}")
-            return []
+            logger.error(f"创建 HF 数据集失败 [{hf_dataset}]: {e}", exc_info=True)
+            return False
 
-    def list_result_files(self, token: str, dataset: str):
-        files = self.list_files(token, dataset)
-        return [f for f in files if str(f).startswith("results/")]
+    # ==================== 文件列表 ====================
 
-    def load_text_file(self, token: str, dataset: str, filename: str):
-        if not token or not dataset or not filename:
-            logger.warning("load_text_file 缺少 token/dataset/filename")
-            return None
+    def list_files(self, hf_token: str, hf_dataset: str):
+        return self._api.list_repo_files(
+            repo_id=hf_dataset,
+            repo_type="dataset",
+            token=hf_token
+        )
 
+    def list_result_files(self, hf_token: str, hf_dataset: str):
+        files = self.list_files(hf_token, hf_dataset)
+        result = []
+        for f in files:
+            if str(f).lower().endswith(".txt"):
+                result.append(f)
+        return result
+
+    # ==================== 下载 ====================
+
+    def load_text_file(self, hf_token: str, hf_dataset: str, filename: str):
         try:
             local_path = hf_hub_download(
-                repo_id=dataset,
+                repo_id=hf_dataset,
                 filename=filename,
                 repo_type="dataset",
-                token=token
+                token=hf_token
             )
             with open(local_path, "r", encoding="utf-8") as f:
                 return f.read()
         except Exception as e:
-            logger.error(f"加载文件失败 [{dataset}/{filename}]: {e}")
+            logger.error(f"加载 HF 文本文件失败 [{hf_dataset}/{filename}]: {e}", exc_info=True)
             return None
 
-    def upload_text_file(self, token: str, dataset: str, filename: str, content: str):
-        if not token or not dataset:
-            raise ValueError("上传失败：缺少 token 或 dataset")
-        if not filename:
-            raise ValueError("上传失败：缺少 filename")
+    # ==================== 上传 ====================
 
-        try:
-            api = self._get_api(token)
-            api.upload_file(
-                path_or_fileobj=(content or "").encode("utf-8"),
-                path_in_repo=filename,
-                repo_id=dataset,
-                repo_type="dataset",
-                token=token
-            )
-            logger.info(f"上传文件成功 [{dataset}/{filename}]")
-            return True
-        except Exception as e:
-            logger.error(f"上传文件失败 [{dataset}/{filename}]: {e}")
-            raise
+    def upload_text_file(self, hf_token: str, hf_dataset: str, filename: str, content: str):
+        content = content or ""
+        binary = content.encode("utf-8")
 
-    def delete_file(self, token: str, dataset: str, filename: str):
-        if not token or not dataset:
-            raise ValueError("删除失败：缺少 token 或 dataset")
-        if not filename:
-            raise ValueError("删除失败：缺少 filename")
+        self._api.upload_file(
+            path_or_fileobj=BytesIO(binary),
+            path_in_repo=filename,
+            repo_id=hf_dataset,
+            repo_type="dataset",
+            token=hf_token
+        )
 
-        try:
-            api = self._get_api(token)
-            api.delete_file(
-                path_in_repo=filename,
-                repo_id=dataset,
-                repo_type="dataset",
-                token=token
-            )
-            logger.info(f"删除文件成功 [{dataset}/{filename}]")
-            return True
-        except Exception as e:
-            logger.error(f"删除文件失败 [{dataset}/{filename}]: {e}")
-            raise
+    # ==================== 删除 ====================
 
-    def create_dataset(self, token: str, dataset: str, private: bool = True):
-        if not token or not dataset:
-            logger.warning("create_dataset 缺少 token 或 dataset")
-            return False
-
-        try:
-            create_repo(
-                repo_id=dataset,
-                repo_type="dataset",
-                private=private,
-                token=token,
-                exist_ok=True
-            )
-            logger.info(f"创建/确认数据集成功 [{dataset}]")
-            return True
-        except Exception as e:
-            logger.error(f"创建数据集失败 [{dataset}]: {e}")
-            return False
+    def delete_file(self, hf_token: str, hf_dataset: str, filename: str):
+        self._api.delete_file(
+            path_in_repo=filename,
+            repo_id=hf_dataset,
+            repo_type="dataset",
+            token=hf_token
+        )
 
 
 hf_dataset_service = HFDatasetService()
