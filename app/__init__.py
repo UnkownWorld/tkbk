@@ -16,7 +16,7 @@ def _get_env_int(name: str, default: int) -> int:
 def create_app():
     app = Flask(
         __name__,
-        static_folder="../static",
+        static_folder="static",
         static_url_path="/static"
     )
 
@@ -25,7 +25,6 @@ def create_app():
     app.config["MAX_THREAD_WORKERS"] = _get_env_int("MAX_THREAD_WORKERS", 10)
     app.config["MAX_CONCURRENT_TASKS"] = _get_env_int("MAX_CONCURRENT_TASKS", 10)
 
-    # 可选：保留一份环境配置快照，便于调试
     app.config["ENV_SNAPSHOT"] = {
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
         "MAX_THREAD_WORKERS": app.config["MAX_THREAD_WORKERS"],
@@ -40,7 +39,6 @@ def create_app():
         "HAS_APP_BATCH_USER_PROMPT_TEMPLATE": bool(os.getenv("APP_BATCH_USER_PROMPT_TEMPLATE")),
     }
 
-    # ==================== 日志 ====================
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
