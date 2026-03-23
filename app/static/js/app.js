@@ -1,5 +1,6 @@
 // ============================================
 // AI Workflow Assistant - Frontend
+// Compatible Final Version
 // ============================================
 
 const $ = (id) => document.getElementById(id);
@@ -37,6 +38,7 @@ function escapeHtml(str) {
 
 function showToast(msg, type = 'info') {
     const c = $('toastContainer');
+    if (!c) return alert(msg);
     const t = document.createElement('div');
     t.className = `toast toast-${type}`;
     t.textContent = msg;
@@ -45,12 +47,12 @@ function showToast(msg, type = 'info') {
 }
 
 function showLoading(text = '处理中...') {
-    $('globalLoadingText').textContent = text;
-    $('globalLoading').classList.remove('hidden');
+    if ($('globalLoadingText')) $('globalLoadingText').textContent = text;
+    if ($('globalLoading')) $('globalLoading').classList.remove('hidden');
 }
 
 function hideLoading() {
-    $('globalLoading').classList.add('hidden');
+    if ($('globalLoading')) $('globalLoading').classList.add('hidden');
 }
 
 function statusText(s) {
@@ -82,6 +84,24 @@ function getConfigNameById(configId) {
     if (!configId) return '默认配置';
     const cfg = state.configs.find(c => c.id === configId);
     return cfg ? cfg.name : '默认配置';
+}
+
+function setVal(ids, value) {
+    for (const id of ids) {
+        const el = $(id);
+        if (el) {
+            el.value = value ?? '';
+            return;
+        }
+    }
+}
+
+function getVal(ids, fallback = '') {
+    for (const id of ids) {
+        const el = $(id);
+        if (el) return el.value ?? fallback;
+    }
+    return fallback;
 }
 
 // ==================== API ====================
@@ -128,6 +148,11 @@ async function loadServerSettings() {
         state.defaultBatchSize = clampInt(state.serverDefaults.batchSize || 10, 10, 1, 100);
         state.batchDelayMin = clampInt(state.serverDefaults.batchDelayMin || 15, 15, 0, 3600);
         state.batchDelayMax = clampInt(state.serverDefaults.batchDelayMax || 45, 45, state.batchDelayMin, 3600);
+
+        // 云端输入框默认回填
+        if ($('cloudHfDataset') && !$('cloudHfDataset').value) {
+            $('cloudHfDataset').value = state.serverDefaults.hfDataset || '';
+        }
     }
 }
 
@@ -154,31 +179,31 @@ function renderServerConfigStatus() {
 }
 
 function renderDefaultsForm() {
-    if ($('defaultApiHost')) $('defaultApiHost').value = state.serverDefaults.apiHost || '';
-    if ($('defaultModel')) $('defaultModel').value = state.serverDefaults.model || '';
-    if ($('defaultTemperature')) $('defaultTemperature').value = state.serverDefaults.temperature ?? 0.7;
-    if ($('defaultTopP')) $('defaultTopP').value = state.serverDefaults.topP ?? 0.65;
-    if ($('defaultMaxOutputTokens')) $('defaultMaxOutputTokens').value = state.serverDefaults.maxOutputTokens ?? 50000;
-    if ($('defaultContextRounds')) $('defaultContextRounds').value = state.serverDefaults.contextRounds ?? 100;
-    if ($('defaultSystemPrompt')) $('defaultSystemPrompt').value = state.serverDefaults.systemPrompt || '';
-    if ($('defaultBatchSystemPrompt')) $('defaultBatchSystemPrompt').value = state.serverDefaults.batchSystemPrompt || '';
-    if ($('defaultBatchUserPromptTemplate')) $('defaultBatchUserPromptTemplate').value = state.serverDefaults.batchUserPromptTemplate || '';
-    if ($('globalBatchSize')) $('globalBatchSize').value = state.defaultBatchSize;
-    if ($('globalDelayMin')) $('globalDelayMin').value = state.batchDelayMin;
-    if ($('globalDelayMax')) $('globalDelayMax').value = state.batchDelayMax;
+    setVal(['defaultApiHost'], state.serverDefaults.apiHost || '');
+    setVal(['defaultModel'], state.serverDefaults.model || '');
+    setVal(['defaultTemperature'], state.serverDefaults.temperature ?? 0.7);
+    setVal(['defaultTopP'], state.serverDefaults.topP ?? 0.65);
+    setVal(['defaultMaxOutputTokens'], state.serverDefaults.maxOutputTokens ?? 50000);
+    setVal(['defaultContextRounds'], state.serverDefaults.contextRounds ?? 100);
+    setVal(['defaultSystemPrompt'], state.serverDefaults.systemPrompt || '');
+    setVal(['defaultBatchSystemPrompt'], state.serverDefaults.batchSystemPrompt || '');
+    setVal(['defaultBatchUserPromptTemplate'], state.serverDefaults.batchUserPromptTemplate || '');
+    setVal(['globalBatchSize'], state.defaultBatchSize);
+    setVal(['globalDelayMin'], state.batchDelayMin);
+    setVal(['globalDelayMax'], state.batchDelayMax);
 }
 
 async function saveDefaults() {
     const payload = {
-        apiHost: $('defaultApiHost')?.value || '',
-        model: $('defaultModel')?.value || '',
-        temperature: $('defaultTemperature')?.value || '',
-        topP: $('defaultTopP')?.value || '',
-        maxOutputTokens: $('defaultMaxOutputTokens')?.value || '',
-        contextRounds: $('defaultContextRounds')?.value || '',
-        systemPrompt: $('defaultSystemPrompt')?.value || '',
-        batchSystemPrompt: $('defaultBatchSystemPrompt')?.value || '',
-        batchUserPromptTemplate: $('defaultBatchUserPromptTemplate')?.value || '',
+        apiHost: getVal(['defaultApiHost']),
+        model: getVal(['defaultModel']),
+        temperature: getVal(['defaultTemperature']),
+        topP: getVal(['defaultTopP']),
+        maxOutputTokens: getVal(['defaultMaxOutputTokens']),
+        contextRounds: getVal(['defaultContextRounds']),
+        systemPrompt: getVal(['defaultSystemPrompt']),
+        batchSystemPrompt: getVal(['defaultBatchSystemPrompt']),
+        batchUserPromptTemplate: getVal(['defaultBatchUserPromptTemplate']),
     };
 
     const data = await api('/api/settings/update', {
@@ -190,6 +215,7 @@ async function saveDefaults() {
         state.serverDefaults = data.settings || {};
         showToast('默认配置已保存', 'success');
         renderServerConfigStatus();
+        renderDefaultsForm();
     } else {
         showToast('保存失败: ' + (data.error || ''), 'error');
     }
@@ -201,19 +227,19 @@ async function loadThreadSettings() {
     if (data.success) {
         state.threadSettings.maxConcurrent = data.maxConcurrent || 10;
         state.threadSettings.threadPoolSize = data.threadPoolSize || 10;
-        if ($('maxConcurrentInput')) $('maxConcurrentInput').value = state.threadSettings.maxConcurrent;
-        if ($('threadPoolSizeInput')) $('threadPoolSizeInput').value = state.threadSettings.threadPoolSize;
-        if ($('globalBatchSize')) $('globalBatchSize').value = data.batchSize || state.defaultBatchSize;
-        if ($('globalDelayMin')) $('globalDelayMin').value = data.batchDelayMin || state.batchDelayMin;
-        if ($('globalDelayMax')) $('globalDelayMax').value = data.batchDelayMax || state.batchDelayMax;
+        setVal(['maxConcurrentInput'], state.threadSettings.maxConcurrent);
+        setVal(['threadPoolSizeInput'], state.threadSettings.threadPoolSize);
+        setVal(['globalBatchSize'], data.batchSize || state.defaultBatchSize);
+        setVal(['globalDelayMin'], data.batchDelayMin || state.batchDelayMin);
+        setVal(['globalDelayMax'], data.batchDelayMax || state.batchDelayMax);
     }
 }
 
 async function saveThreadSettings() {
-    const maxConcurrent = clampInt($('maxConcurrentInput')?.value || 10, 10, 1, 50);
-    const threadPoolSize = clampInt($('threadPoolSizeInput')?.value || 10, 10, 1, 100);
-    const delayMin = clampInt($('globalDelayMin')?.value || state.batchDelayMin, state.batchDelayMin, 0, 3600);
-    const delayMax = clampInt($('globalDelayMax')?.value || state.batchDelayMax, state.batchDelayMax, delayMin, 3600);
+    const maxConcurrent = clampInt(getVal(['maxConcurrentInput'], 10), 10, 1, 50);
+    const threadPoolSize = clampInt(getVal(['threadPoolSizeInput'], 10), 10, 1, 100);
+    const delayMin = clampInt(getVal(['globalDelayMin'], state.batchDelayMin), state.batchDelayMin, 0, 3600);
+    const delayMax = clampInt(getVal(['globalDelayMax'], state.batchDelayMax), state.batchDelayMax, delayMin, 3600);
 
     const r1 = await api('/api/set-concurrent', {
         method: 'POST',
@@ -281,20 +307,23 @@ function renderConfigList() {
 
 function clearConfigForm() {
     state.editingConfigId = null;
-    if ($('configName')) $('configName').value = '';
-    if ($('configSystemPrompt')) $('configSystemPrompt').value = '';
-    if ($('configBatchSystemPrompt')) $('configBatchSystemPrompt').value = '';
-    if ($('configBatchUserPromptTemplate')) $('configBatchUserPromptTemplate').value = '';
-    if ($('configBatchSize')) $('configBatchSize').value = '';
-    if ($('configModel')) $('configModel').value = '';
-    if ($('configTemperature')) $('configTemperature').value = '';
-    if ($('configTopP')) $('configTopP').value = '';
-    if ($('configContextRounds')) $('configContextRounds').value = '';
-    if ($('configApiHost')) $('configApiHost').value = '';
-    if ($('configApiKey')) $('configApiKey').value = '';
-    if ($('configMaxOutputTokens')) $('configMaxOutputTokens').value = '';
-    if ($('configHfToken')) $('configHfToken').value = '';
-    if ($('configHfDataset')) $('configHfDataset').value = '';
+    setVal(['configName', 'cfgName'], '');
+    setVal(['configSystemPrompt', 'cfgSystemPrompt'], '');
+    setVal(['configBatchSystemPrompt', 'cfgBatchSystemPrompt'], '');
+    setVal(['configBatchUserPromptTemplate', 'cfgBatchUserPromptTemplate'], '');
+    setVal(['configBatchSize', 'cfgBatchSize'], '');
+    setVal(['configModel', 'cfgModel'], '');
+    setVal(['configTemperature', 'cfgTemperature'], '');
+    setVal(['configTopP', 'cfgTopP'], '');
+    setVal(['configContextRounds', 'cfgContextRounds'], '');
+    setVal(['configApiHost', 'cfgApiHost'], '');
+    setVal(['configApiKey', 'cfgApiKey'], '');
+    setVal(['configMaxOutputTokens', 'cfgMaxOutputTokens'], '');
+    setVal(['configHfToken', 'cfgHfToken'], '');
+    setVal(['configHfDataset', 'cfgHfDataset'], '');
+
+    const btnDelete = $('btnDeleteConfig');
+    if (btnDelete) btnDelete.style.display = 'none';
 }
 
 function editConfig(configId) {
@@ -302,20 +331,23 @@ function editConfig(configId) {
     if (!cfg) return;
     state.editingConfigId = configId;
 
-    if ($('configName')) $('configName').value = cfg.name || '';
-    if ($('configSystemPrompt')) $('configSystemPrompt').value = cfg.systemPrompt || '';
-    if ($('configBatchSystemPrompt')) $('configBatchSystemPrompt').value = cfg.batchSystemPrompt || '';
-    if ($('configBatchUserPromptTemplate')) $('configBatchUserPromptTemplate').value = cfg.batchUserPromptTemplate || '';
-    if ($('configBatchSize')) $('configBatchSize').value = cfg.batchSize || '';
-    if ($('configModel')) $('configModel').value = cfg.model || '';
-    if ($('configTemperature')) $('configTemperature').value = cfg.temperature || '';
-    if ($('configTopP')) $('configTopP').value = cfg.topP || '';
-    if ($('configContextRounds')) $('configContextRounds').value = cfg.contextRounds || '';
-    if ($('configApiHost')) $('configApiHost').value = cfg.apiHost || '';
-    if ($('configApiKey')) $('configApiKey').value = '';
-    if ($('configMaxOutputTokens')) $('configMaxOutputTokens').value = cfg.maxOutputTokens || '';
-    if ($('configHfToken')) $('configHfToken').value = '';
-    if ($('configHfDataset')) $('configHfDataset').value = cfg.hfDataset || '';
+    setVal(['configName', 'cfgName'], cfg.name || '');
+    setVal(['configSystemPrompt', 'cfgSystemPrompt'], cfg.systemPrompt || '');
+    setVal(['configBatchSystemPrompt', 'cfgBatchSystemPrompt'], cfg.batchSystemPrompt || '');
+    setVal(['configBatchUserPromptTemplate', 'cfgBatchUserPromptTemplate'], cfg.batchUserPromptTemplate || '');
+    setVal(['configBatchSize', 'cfgBatchSize'], cfg.batchSize || '');
+    setVal(['configModel', 'cfgModel'], cfg.model || '');
+    setVal(['configTemperature', 'cfgTemperature'], cfg.temperature || '');
+    setVal(['configTopP', 'cfgTopP'], cfg.topP || '');
+    setVal(['configContextRounds', 'cfgContextRounds'], cfg.contextRounds || '');
+    setVal(['configApiHost', 'cfgApiHost'], cfg.apiHost || '');
+    setVal(['configApiKey', 'cfgApiKey'], '');
+    setVal(['configMaxOutputTokens', 'cfgMaxOutputTokens'], cfg.maxOutputTokens || '');
+    setVal(['configHfToken', 'cfgHfToken'], '');
+    setVal(['configHfDataset', 'cfgHfDataset'], cfg.hfDataset || '');
+
+    const btnDelete = $('btnDeleteConfig');
+    if (btnDelete) btnDelete.style.display = 'inline-flex';
 
     showToast('已加载配置到编辑区', 'info');
 }
@@ -324,20 +356,20 @@ async function saveConfig() {
     const payload = {
         userId: 'default',
         id: state.editingConfigId || '',
-        name: $('configName')?.value || '未命名配置',
-        systemPrompt: $('configSystemPrompt')?.value || '',
-        batchSystemPrompt: $('configBatchSystemPrompt')?.value || '',
-        batchUserPromptTemplate: $('configBatchUserPromptTemplate')?.value || '',
-        batchSize: $('configBatchSize')?.value || '',
-        model: $('configModel')?.value || '',
-        temperature: $('configTemperature')?.value || '',
-        topP: $('configTopP')?.value || '',
-        contextRounds: $('configContextRounds')?.value || '',
-        apiHost: $('configApiHost')?.value || '',
-        apiKey: $('configApiKey')?.value || '',
-        maxOutputTokens: $('configMaxOutputTokens')?.value || '',
-        hfToken: $('configHfToken')?.value || '',
-        hfDataset: $('configHfDataset')?.value || '',
+        name: getVal(['configName', 'cfgName'], '未命名配置'),
+        systemPrompt: getVal(['configSystemPrompt', 'cfgSystemPrompt']),
+        batchSystemPrompt: getVal(['configBatchSystemPrompt', 'cfgBatchSystemPrompt']),
+        batchUserPromptTemplate: getVal(['configBatchUserPromptTemplate', 'cfgBatchUserPromptTemplate']),
+        batchSize: getVal(['configBatchSize', 'cfgBatchSize']),
+        model: getVal(['configModel', 'cfgModel']),
+        temperature: getVal(['configTemperature', 'cfgTemperature']),
+        topP: getVal(['configTopP', 'cfgTopP']),
+        contextRounds: getVal(['configContextRounds', 'cfgContextRounds']),
+        apiHost: getVal(['configApiHost', 'cfgApiHost']),
+        apiKey: getVal(['configApiKey', 'cfgApiKey']),
+        maxOutputTokens: getVal(['configMaxOutputTokens', 'cfgMaxOutputTokens']),
+        hfToken: getVal(['configHfToken', 'cfgHfToken']),
+        hfDataset: getVal(['configHfDataset', 'cfgHfDataset']),
     };
 
     const data = await api('/api/config/save', {
@@ -354,14 +386,21 @@ async function saveConfig() {
     }
 }
 
-async function deleteConfig(configId) {
+async function deleteConfig(configId = null) {
+    const id = configId || state.editingConfigId;
+    if (!id) {
+        showToast('没有可删除的配置', 'warning');
+        return;
+    }
+
     const data = await api('/api/config/delete', {
         method: 'POST',
-        body: JSON.stringify({ userId: 'default', id: configId })
+        body: JSON.stringify({ userId: 'default', id })
     });
 
     if (data.success) {
         showToast('配置已删除', 'success');
+        clearConfigForm();
         refreshConfigs();
     } else {
         showToast('删除失败: ' + (data.error || ''), 'error');
@@ -498,7 +537,6 @@ async function sendChat() {
 }
 
 // ==================== 章节解析（本地） ====================
-
 const SPECIAL_CHAPTER_TITLES = new Set([
     '序章', '序', '楔子', '引子', '前言', '正文',
     '终章', '尾声', '后记', '番外', '番外篇', '完结感言'
@@ -582,10 +620,6 @@ function isChapterTitleWithContext(lines, index, strongCount, weakCount) {
     return false;
 }
 
-/**
- * 本地解析章节
- * 当前版本在主线程中解析，规则已与后端尽量保持一致。
- */
 function parseChaptersLocal(content) {
     const safeContent = normalizeText(content);
     if (!safeContent) return [];
@@ -639,99 +673,48 @@ function parseChaptersLocal(content) {
 }
 
 // ==================== 批处理文件 ====================
-
 function buildLocalBatchFileFingerprint(fileName, chapters) {
     return `${fileName}::${chapters.length}`;
 }
 
-/**
- * 批处理文件解析
- * 当前版本使用主线程 FileReader + 本地章节解析。
- */
 async function handleBatchFiles(files) {
     const txtFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.txt'));
     if (txtFiles.length === 0) {
-        showToast('请选择.txt文件', 'warning');
+        showToast('请选择 .txt 文件', 'warning');
         return;
     }
 
-    const progressContainer = document.createElement('div');
-    progressContainer.id = 'batchProgress';
-    progressContainer.innerHTML = `
-        <div class="progress-overlay">
-            <div class="progress-card">
-                <div class="progress-title">正在解析文件...</div>
-                <div class="progress-bar-container">
-                    <div class="progress-bar" id="batchProgressBar"></div>
-                </div>
-                <div class="progress-text" id="batchProgressText">0/${txtFiles.length}</div>
-                <div class="progress-files" id="batchProgressFiles"></div>
-            </div>
-        </div>
-    `;
-    document.body.appendChild(progressContainer);
+    showLoading('正在解析文件...');
+    let successCount = 0;
+    let duplicateCount = 0;
 
-    const progressBar = $('batchProgressBar');
-    const progressText = $('batchProgressText');
-    const progressFiles = $('batchProgressFiles');
-
-    let completed = 0;
-
-    const parsePromises = txtFiles.map((file) => {
-        return new Promise((resolve) => {
+    for (const file of txtFiles) {
+        const result = await new Promise((resolve) => {
             const reader = new FileReader();
-
             reader.onload = (e) => {
                 const content = e.target.result || '';
                 const chapters = parseChaptersLocal(content);
-                completed++;
-
-                const percent = Math.round((completed / txtFiles.length) * 100);
-                progressBar.style.width = percent + '%';
-                progressText.textContent = `${completed}/${txtFiles.length}`;
-                progressFiles.innerHTML = `<div class="progress-file">✓ ${escapeHtml(file.name)}: ${chapters.length} 章</div>` + progressFiles.innerHTML;
-
                 resolve({
                     fileName: file.name,
                     chapters,
                     success: chapters.length > 0
                 });
             };
-
-            reader.onerror = () => {
-                completed++;
-                progressBar.style.width = Math.round((completed / txtFiles.length) * 100) + '%';
-                progressText.textContent = `${completed}/${txtFiles.length}`;
-                progressFiles.innerHTML = `<div class="progress-file error">✗ ${escapeHtml(file.name)}: 读取失败</div>` + progressFiles.innerHTML;
-                resolve({
-                    fileName: file.name,
-                    chapters: [],
-                    success: false
-                });
-            };
-
+            reader.onerror = () => resolve({
+                fileName: file.name,
+                chapters: [],
+                success: false
+            });
             reader.readAsText(file);
         });
-    });
 
-    const allResults = await Promise.all(parsePromises);
-
-    if (progressContainer.parentNode) {
-        document.body.removeChild(progressContainer);
-    }
-
-    let successCount = 0;
-    let duplicateCount = 0;
-
-    allResults.forEach(result => {
-        if (!result.success || result.chapters.length === 0) return;
+        if (!result.success || result.chapters.length === 0) continue;
 
         const localFingerprint = buildLocalBatchFileFingerprint(result.fileName, result.chapters);
         const exists = state.batchFiles.some(f => f.localFingerprint === localFingerprint);
-
         if (exists) {
             duplicateCount++;
-            return;
+            continue;
         }
 
         const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -746,8 +729,9 @@ async function handleBatchFiles(files) {
             endChapter: result.chapters.length
         });
         successCount++;
-    });
+    }
 
+    hideLoading();
     renderBatchFiles();
 
     let msg = `成功解析 ${successCount}/${txtFiles.length} 个文件`;
@@ -798,37 +782,22 @@ function renderBatchFiles() {
 
             <div class="batch-file-config">
                 <label>批次大小:</label>
-                <input type="number"
-                       class="form-input"
-                       value="${f.batchSize || state.defaultBatchSize}"
-                       min="1"
-                       max="100"
-                       onchange="updateBatchFileSize('${f.fileId}', this.value)"
-                       style="width:90px;">
+                <input type="number" class="form-input" value="${f.batchSize || state.defaultBatchSize}" min="1" max="100"
+                       onchange="updateBatchFileSize('${f.fileId}', this.value)" style="width:90px;">
                 <span style="font-size:12px;color:var(--text-muted);">章/批次</span>
             </div>
 
             <div class="batch-file-config">
                 <label>起始章节:</label>
-                <input type="number"
-                       class="form-input"
-                       value="${start}"
-                       min="1"
-                       max="${Math.max(1, total)}"
-                       onchange="updateBatchFileStartChapter('${f.fileId}', this.value)"
-                       style="width:100px;">
+                <input type="number" class="form-input" value="${start}" min="1" max="${Math.max(1, total)}"
+                       onchange="updateBatchFileStartChapter('${f.fileId}', this.value)" style="width:100px;">
                 <span style="font-size:12px;color:var(--text-muted);">从第几章开始</span>
             </div>
 
             <div class="batch-file-config">
                 <label>结束章节:</label>
-                <input type="number"
-                       class="form-input"
-                       value="${end}"
-                       min="1"
-                       max="${Math.max(1, total)}"
-                       onchange="updateBatchFileEndChapter('${f.fileId}', this.value)"
-                       style="width:100px;">
+                <input type="number" class="form-input" value="${end}" min="1" max="${Math.max(1, total)}"
+                       onchange="updateBatchFileEndChapter('${f.fileId}', this.value)" style="width:100px;">
                 <span style="font-size:12px;color:var(--text-muted);">处理到第几章</span>
             </div>
 
@@ -847,6 +816,12 @@ function renderBatchFiles() {
 function removeBatchFile(fileId) {
     state.batchFiles = state.batchFiles.filter(f => f.fileId !== fileId);
     renderBatchFiles();
+}
+
+function clearBatchFiles() {
+    state.batchFiles = [];
+    renderBatchFiles();
+    showToast('已清空待提交文件', 'info');
 }
 
 function updateBatchFileConfig(fileId, configId) {
@@ -868,24 +843,18 @@ function updateBatchFileSize(fileId, batchSize) {
 function updateBatchFileStartChapter(fileId, startChapter) {
     const f = state.batchFiles.find(x => x.fileId === fileId);
     if (!f) return;
-
     const total = f.chapters.length;
     f.startChapter = clampInt(startChapter, 1, 1, total);
-    if (f.startChapter > f.endChapter) {
-        f.endChapter = f.startChapter;
-    }
+    if (f.startChapter > f.endChapter) f.endChapter = f.startChapter;
     renderBatchFiles();
 }
 
 function updateBatchFileEndChapter(fileId, endChapter) {
     const f = state.batchFiles.find(x => x.fileId === fileId);
     if (!f) return;
-
     const total = f.chapters.length;
     f.endChapter = clampInt(endChapter, total, 1, total);
-    if (f.endChapter < f.startChapter) {
-        f.startChapter = f.endChapter;
-    }
+    if (f.endChapter < f.startChapter) f.startChapter = f.endChapter;
     renderBatchFiles();
 }
 
@@ -894,9 +863,9 @@ async function submitBatch() {
 
     showLoading('正在提交批处理任务...');
 
-    const globalBatchSize = clampInt($('globalBatchSize')?.value || state.defaultBatchSize, state.defaultBatchSize, 1, 100);
-    const delayMin = clampInt($('globalDelayMin')?.value || state.batchDelayMin, state.batchDelayMin, 0, 3600);
-    const delayMax = clampInt($('globalDelayMax')?.value || state.batchDelayMax, state.batchDelayMax, delayMin, 3600);
+    const globalBatchSize = clampInt(getVal(['globalBatchSize'], state.defaultBatchSize), state.defaultBatchSize, 1, 100);
+    const delayMin = clampInt(getVal(['globalDelayMin'], state.batchDelayMin), state.batchDelayMin, 0, 3600);
+    const delayMax = clampInt(getVal(['globalDelayMax'], state.batchDelayMax), state.batchDelayMax, delayMin, 3600);
 
     const files = state.batchFiles.map(f => ({
         fileName: f.fileName,
@@ -923,13 +892,8 @@ async function submitBatch() {
 
     if (data.success) {
         let msg = `任务已提交：${data.totalChapters} 个章节`;
-        if (data.queuedFiles !== undefined) {
-            msg += `，入队 ${data.queuedFiles} 本`;
-        }
-        if (data.duplicateFiles && data.duplicateFiles.length > 0) {
-            msg += `，重复跳过 ${data.duplicateFiles.length} 本`;
-        }
-
+        if (data.queuedFiles !== undefined) msg += `，入队 ${data.queuedFiles} 本`;
+        if (data.duplicateFiles && data.duplicateFiles.length > 0) msg += `，重复跳过 ${data.duplicateFiles.length} 本`;
         showToast(msg, 'success');
 
         if (data.duplicateFiles && data.duplicateFiles.length > 0) {
@@ -966,7 +930,7 @@ function renderTaskList() {
 
     const tasks = Object.values(state.tasks || {}).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
     if (tasks.length === 0) {
-        container.innerHTML = `<div style="font-size:13px;color:var(--text-muted);">暂无任务</div>`;
+        container.innerHTML = `<div class="empty-state"><div class="icon">📋</div><p>暂无任务</p></div>`;
         return;
     }
 
@@ -990,7 +954,7 @@ function renderTaskList() {
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
                 <button class="btn btn-sm btn-secondary" onclick="viewTask('${task.task_id}')">查看</button>
                 <button class="btn btn-sm btn-secondary" onclick="downloadTask('${task.task_id}')">导出</button>
-                ${task.status === 'pending' || task.status === 'processing'
+                ${(task.status === 'pending' || task.status === 'processing')
                     ? `<button class="btn btn-sm btn-danger" onclick="cancelTask('${task.task_id}')">取消</button>`
                     : ''
                 }
@@ -998,6 +962,14 @@ function renderTaskList() {
             </div>
         </div>
     `).join('');
+}
+
+function getTaskModalElements() {
+    return {
+        modal: $('taskViewModal') || $('taskDetailModal'),
+        body: $('taskViewBody') || $('taskDetailBody'),
+        title: $('taskViewTitle')
+    };
 }
 
 async function viewTask(taskId) {
@@ -1009,9 +981,16 @@ async function viewTask(taskId) {
 
     state.viewingTaskId = taskId;
     const task = data.task;
-    const modal = $('taskDetailModal');
-    const body = $('taskDetailBody');
-    if (!modal || !body) return;
+    const { modal, body, title } = getTaskModalElements();
+
+    if (!modal || !body) {
+        showToast('任务详情弹窗未找到', 'error');
+        return;
+    }
+
+    if (title) {
+        title.textContent = `任务 ${String(task.task_id || '').slice(0, 8)} 详情`;
+    }
 
     body.innerHTML = `
         <div style="margin-bottom:12px;">
@@ -1058,7 +1037,7 @@ async function viewTask(taskId) {
 }
 
 function closeTaskDetail() {
-    const modal = $('taskDetailModal');
+    const { modal } = getTaskModalElements();
     if (modal) modal.classList.add('hidden');
 }
 
@@ -1122,8 +1101,9 @@ function downloadTextFile(filename, content) {
 
 // ==================== 云端文件 ====================
 async function refreshCloudFiles() {
-    const hfDataset = state.serverDefaults.hfDataset || '';
-    const data = await api(`/api/hf-files?hfToken=&hfDataset=${encodeURIComponent(hfDataset)}`);
+    const hfToken = $('cloudHfToken')?.value || '';
+    const hfDataset = $('cloudHfDataset')?.value || state.serverDefaults.hfDataset || '';
+    const data = await api(`/api/hf-files?hfToken=${encodeURIComponent(hfToken)}&hfDataset=${encodeURIComponent(hfDataset)}`);
     if (data.success) {
         state.cloudFiles = data.files || [];
         renderCloudFiles();
@@ -1154,8 +1134,8 @@ async function downloadCloudFile(encodedPath) {
     const data = await api('/api/hf-download', {
         method: 'POST',
         body: JSON.stringify({
-            hfToken: '',
-            hfDataset: state.serverDefaults.hfDataset || '',
+            hfToken: $('cloudHfToken')?.value || '',
+            hfDataset: $('cloudHfDataset')?.value || state.serverDefaults.hfDataset || '',
             filename
         })
     });
@@ -1193,9 +1173,7 @@ function bindEvents() {
 
     if ($('batchUploadArea')) {
         $('batchUploadArea').addEventListener('click', () => $('batchFileInput')?.click());
-        $('batchUploadArea').addEventListener('dragover', (e) => {
-            e.preventDefault();
-        });
+        $('batchUploadArea').addEventListener('dragover', (e) => e.preventDefault());
         $('batchUploadArea').addEventListener('drop', (e) => {
             e.preventDefault();
             handleBatchFiles(e.dataTransfer.files || []);
@@ -1203,11 +1181,32 @@ function bindEvents() {
     }
 
     if ($('btnSubmitBatch')) $('btnSubmitBatch').addEventListener('click', submitBatch);
+    if ($('btnClearBatch')) $('btnClearBatch').addEventListener('click', clearBatchFiles);
+
     if ($('btnSaveDefaults')) $('btnSaveDefaults').addEventListener('click', saveDefaults);
     if ($('btnSaveThreadSettings')) $('btnSaveThreadSettings').addEventListener('click', saveThreadSettings);
     if ($('btnSaveConfig')) $('btnSaveConfig').addEventListener('click', saveConfig);
+    if ($('btnDeleteConfig')) $('btnDeleteConfig').addEventListener('click', () => deleteConfig());
     if ($('btnClearConfigForm')) $('btnClearConfigForm').addEventListener('click', clearConfigForm);
+    if ($('btnCancelConfig')) $('btnCancelConfig').addEventListener('click', clearConfigForm);
+
     if ($('btnCloseTaskDetail')) $('btnCloseTaskDetail').addEventListener('click', closeTaskDetail);
+    if ($('btnCloseTaskView')) $('btnCloseTaskView').addEventListener('click', closeTaskDetail);
+    if ($('btnCloseTaskView2')) $('btnCloseTaskView2').addEventListener('click', closeTaskDetail);
+
+    if ($('btnRefreshTasks')) $('btnRefreshTasks').addEventListener('click', refreshTasks);
+    if ($('btnRefreshCloudFiles')) $('btnRefreshCloudFiles').addEventListener('click', refreshCloudFiles);
+    if ($('btnDownloadFromView')) $('btnDownloadFromView').addEventListener('click', () => {
+        if (state.viewingTaskId) downloadTask(state.viewingTaskId);
+    });
+
+    document.querySelectorAll('.toggle-visibility').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const target = $(btn.dataset.target);
+            if (!target) return;
+            target.type = target.type === 'password' ? 'text' : 'password';
+        });
+    });
 }
 
 function startTaskPolling() {
@@ -1248,5 +1247,6 @@ window.deleteTask = deleteTask;
 window.downloadTask = downloadTask;
 window.downloadSingleNovel = downloadSingleNovel;
 window.downloadCloudFile = downloadCloudFile;
+window.refreshCloudFiles = refreshCloudFiles;
 
 document.addEventListener('DOMContentLoaded', init);
