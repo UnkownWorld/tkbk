@@ -1,250 +1,309 @@
-import os
-import json
+import copy
 import logging
+import os
+
+from app.stores.conversation_config_store import conversation_config_store
 
 logger = logging.getLogger(__name__)
 
-# 默认兜底路径（当 current_app 不可用时使用）
-_FALLBACK_USER_DEFAULTS_FILE = "/app/data/user_defaults.json"
+
+DEFAULT_RUNTIME_CONFIG = {
+    "apiHost": "",
+    "apiKey": "",
+    "model": "gpt-5.4",
+    "temperature": 0.7,
+    "topP": 0.65,
+    "contextRounds": 100,
+    "maxOutputTokens": 1000000,
+    "systemPrompt": "",
+    "batchSystemPrompt": "",
+    "batchUserPromptTemplate": "",
+    "batchSize": 10,
+    "hfToken": "",
+    "hfDataset": "",
+}
+
+
+DEFAULT_BATCH_SYSTEM_PROMPT = (
+    "你是一个小说节奏链条提取助手。"
+    "必须严格遵守用户输入的提示词规则。"
+    "你的任务仅是提取每章节的节奏链条，保留章节标题。"
+    "只输出章节标题与节奏链条内容。"
+    "使用“→”连接节奏点。"
+    "禁止分析伏笔、意象、主题、写法、人物心理、象征、修辞。"
+    "禁止总结、评价、解释、扩写。"
+    "不要输出JSON，不要输出代码块。"
+)
+
+DEFAULT_BATCH_USER_PROMPT_TEMPLATE = "请严格按照系统要求，提取下面章节的节奏链条：\n\n{content}"
+
+
+def _safe_str(v):
+    if v is None:
+        return ""
+    return str(v)
+
+
+def _safe_int(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 class AppSettingsService:
-    def get_app_name(self):
-        from flask import current_app
-        return current_app.config.get("APP_NAME", "AI Workflow Assistant")
+    """
+    最终版设置服务：
+    - 统一系统默认配置
+    - 提供 resolve_config_from_id
+    - 统一环境变量 fallback
+    """
 
-    def get_hf_token(self):
-        from flask import current_app
-        return current_app.config.get("HF_TOKEN", "")
+    def __init__(self):
+        self._runtime_defaults = copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
+        self._load_env_defaults()
 
-    def get_hf_dataset(self):
-        from flask import current_app
-        return current_app.config.get("HF_DATASET", "")
+    # ==================== 环境变量 ====================
 
-    def get_hf_username(self):
-        from flask import current_app
-        return current_app.config.get("HF_USERNAME", "")
+    def _load_env_defaults(self):
+        self._runtime_defaults["apiHost"] = _safe_str(os.getenv("APP_API_HOST", self._runtime_defaults["apiHost"])).strip()
+        self._runtime_defaults["apiKey"] = _safe_str(os.getenv("APP_API_KEY", self._runtime_defaults["apiKey"])).strip()
+        self._runtime_defaults["model"] = _safe_str(os.getenv("APP_MODEL", self._runtime_defaults["model"])).strip() or "gpt-5.4"
 
-    def get_max_concurrent_tasks(self):
-        from flask import current_app
-        return current_app.config.get("MAX_CONCURRENT_TASKS", 10)
+        self._runtime_defaults["temperature"] = _safe_float(
+            os.getenv("APP_TEMPERATURE", self._runtime_defaults["temperature"]),
+            self._runtime_defaults["temperature"]
+        )
+        self._runtime_defaults["topP"] = _safe_float(
+            os.getenv("APP_TOP_P", self._runtime_defaults["topP"]),
+            self._runtime_defaults["topP"]
+        )
+        self._runtime_defaults["contextRounds"] = _safe_int(
+            os.getenv("APP_CONTEXT_ROUNDS", self._runtime_defaults["contextRounds"]),
+            self._runtime_defaults["contextRounds"]
+        )
+        self._runtime_defaults["maxOutputTokens"] = _safe_int(
+            os.getenv("APP_MAX_OUTPUT_TOKENS", self._runtime_defaults["maxOutputTokens"]),
+            self._runtime_defaults["maxOutputTokens"]
+        )
+        self._runtime_defaults["batchSize"] = _safe_int(
+            os.getenv("APP_BATCH_SIZE", self._runtime_defaults["batchSize"]),
+            self._runtime_defaults["batchSize"]
+        )
 
-    def _get_user_defaults_file(self):
-        """
-        优先从 Flask 配置中读取持久化路径，便于 HF Space / Docker 环境调整。
-        """
-        try:
-            from flask import current_app
-            return current_app.config.get("USER_DEFAULTS_FILE", _FALLBACK_USER_DEFAULTS_FILE)
-        except Exception:
-            return _FALLBACK_USER_DEFAULTS_FILE
+        self._runtime_defaults["systemPrompt"] = _safe_str(
+            os.getenv("APP_SYSTEM_PROMPT", self._runtime_defaults["systemPrompt"])
+        )
+        self._runtime_defaults["batchSystemPrompt"] = _safe_str(
+            os.getenv("APP_BATCH_SYSTEM_PROMPT", DEFAULT_BATCH_SYSTEM_PROMPT)
+        )
+        self._runtime_defaults["batchUserPromptTemplate"] = _safe_str(
+            os.getenv("APP_BATCH_USER_PROMPT_TEMPLATE", DEFAULT_BATCH_USER_PROMPT_TEMPLATE)
+        )
 
-    def _load_user_defaults(self):
-        """
-        加载用户修改过的默认配置（非敏感字段）
-        """
-        path = self._get_user_defaults_file()
-        try:
-            if not os.path.exists(path):
-                return {}
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception as e:
-            logger.warning(f"加载用户默认配置失败 [{path}]: {e}")
-            return {}
+        self._runtime_defaults["hfToken"] = _safe_str(
+            os.getenv("APP_HF_TOKEN", self._runtime_defaults["hfToken"])
+        ).strip()
+        self._runtime_defaults["hfDataset"] = _safe_str(
+            os.getenv("APP_HF_DATASET", self._runtime_defaults["hfDataset"])
+        ).strip()
 
-    def _save_user_defaults(self, data: dict):
-        """
-        保存用户修改过的默认配置
-        返回：
-            {"success": True}
-            或
-            {"success": False, "error": "..."}
-        """
-        path = self._get_user_defaults_file()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"保存用户默认配置失败 [{path}]: {e}")
-            return {"success": False, "error": str(e)}
+        logger.info(
+            "已加载环境默认配置: "
+            f"apiHost={self._runtime_defaults.get('apiHost')!r}, "
+            f"model={self._runtime_defaults.get('model')!r}, "
+            f"batchSystemPrompt_len={len(self._runtime_defaults.get('batchSystemPrompt') or '')}, "
+            f"batchUserPromptTemplate_len={len(self._runtime_defaults.get('batchUserPromptTemplate') or '')}"
+        )
 
-    def _get_cfg(self):
-        from flask import current_app
-        return current_app.config
-
-    def _build_runtime_config(self, include_secrets: bool = False):
-        """
-        统一构造运行配置
-        """
-        cfg = self._get_cfg()
-        user_overrides = self._load_user_defaults()
-
-        result = {
-            "apiHost": user_overrides.get("apiHost", cfg.get("DEFAULT_API_HOST", "")),
-            "model": user_overrides.get("model", cfg.get("DEFAULT_MODEL", "gpt-5.4")),
-            "temperature": user_overrides.get("temperature", cfg.get("DEFAULT_TEMPERATURE", 0.7)),
-            "topP": user_overrides.get("topP", cfg.get("DEFAULT_TOP_P", 0.65)),
-            # 统一以 maxOutputTokens 为主，maxTokens 仅兼容保留
-            "maxOutputTokens": user_overrides.get(
-                "maxOutputTokens",
-                cfg.get("DEFAULT_MAX_OUTPUT_TOKENS", 50000)
-            ),
-            "maxTokens": user_overrides.get(
-                "maxTokens",
-                cfg.get("DEFAULT_MAX_TOKENS", 1000000)
-            ),
-            "contextRounds": user_overrides.get("contextRounds", cfg.get("DEFAULT_CONTEXT_ROUNDS", 100)),
-            "systemPrompt": user_overrides.get("systemPrompt", cfg.get("DEFAULT_SYSTEM_PROMPT", "")),
-            "batchSystemPrompt": user_overrides.get("batchSystemPrompt", cfg.get("DEFAULT_BATCH_SYSTEM_PROMPT", "")),
-            "batchUserPromptTemplate": user_overrides.get(
-                "batchUserPromptTemplate",
-                cfg.get("DEFAULT_BATCH_USER_PROMPT_TEMPLATE", "")
-            ),
-            "hfDataset": cfg.get("HF_DATASET", ""),
-            "hasHfDataset": bool(cfg.get("HF_DATASET", "")),
-        }
-
-        if include_secrets:
-            result.update({
-                "apiKey": cfg.get("DEFAULT_API_KEY", ""),
-                "hfToken": cfg.get("HF_TOKEN", ""),
-                "hfDataset": cfg.get("HF_DATASET", ""),
-            })
-        else:
-            result.update({
-                "hasApiKey": bool(cfg.get("DEFAULT_API_KEY", "")),
-                "hasHfToken": bool(cfg.get("HF_TOKEN", "")),
-            })
-
-        return result
+    # ==================== 默认配置 ====================
 
     def get_default_runtime_config(self):
-        """
-        返回默认配置给前端：
-        - 非敏感字段：返回实际值
-        - 敏感字段：返回 hasXxx
-        """
-        return self._build_runtime_config(include_secrets=False)
-
-    def update_user_defaults(self, updates: dict):
-        """
-        更新用户修改的默认配置（仅允许非敏感字段）
-        返回：
-            {"success": True, "settings": ...}
-            或
-            {"success": False, "error": "...", "settings": ...}
-        """
-        allowed = {
-            "model",
-            "temperature",
-            "topP",
-            "maxTokens",
-            "maxOutputTokens",
-            "contextRounds",
-            "systemPrompt",
-            "apiHost",
-            "batchSystemPrompt",
-            "batchUserPromptTemplate",
-        }
-
-        user_defaults = self._load_user_defaults()
-
-        for key in allowed:
-            if key in updates and updates[key] is not None and updates[key] != "":
-                user_defaults[key] = updates[key]
-            elif key in updates and (updates[key] is None or updates[key] == ""):
-                user_defaults.pop(key, None)
-
-        save_result = self._save_user_defaults(user_defaults)
-        logger.info(f"用户默认配置已更新: {list(user_defaults.keys())}")
-
-        if save_result.get("success"):
-            return {
-                "success": True,
-                "settings": self.get_default_runtime_config()
-            }
-
-        return {
-            "success": False,
-            "error": save_result.get("error", "保存失败"),
-            "settings": self.get_default_runtime_config()
-        }
+        return copy.deepcopy(self._runtime_defaults)
 
     def get_full_config(self):
         """
-        内部使用，返回完整配置（含 apiKey / hfToken）
+        兼容旧代码命名：返回完整系统默认配置
         """
-        return self._build_runtime_config(include_secrets=True)
+        return self.get_default_runtime_config()
 
-    def resolve_config(self, user_config: dict = None):
-        """
-        合并用户配置和默认配置，用户配置优先
-        """
-        default = self.get_full_config()
-        if not user_config:
-            return default
+    def get_hf_token(self):
+        return _safe_str(self._runtime_defaults.get("hfToken")).strip()
 
-        merged = default.copy()
-        for key in [
-            "apiHost",
-            "apiKey",
-            "model",
-            "temperature",
-            "topP",
-            "maxTokens",
-            "maxOutputTokens",
-            "contextRounds",
-            "systemPrompt",
-            "batchSystemPrompt",
-            "batchUserPromptTemplate",
-            "batchSize",
-            "hfToken",
-            "hfDataset",
-        ]:
-            if key in user_config and user_config[key]:
-                merged[key] = user_config[key]
+    def get_hf_dataset(self):
+        return _safe_str(self._runtime_defaults.get("hfDataset")).strip()
+
+    # ==================== 用户默认配置更新 ====================
+
+    def update_user_defaults(self, data: dict):
+        """
+        更新系统运行默认值（当前版本为内存级）。
+        若以后需要持久化，可在这里接入文件或数据库。
+        """
+        data = data or {}
+
+        updated = copy.deepcopy(self._runtime_defaults)
+
+        if "apiHost" in data:
+            updated["apiHost"] = _safe_str(data.get("apiHost")).strip()
+        if "apiKey" in data:
+            updated["apiKey"] = _safe_str(data.get("apiKey")).strip()
+        if "model" in data:
+            updated["model"] = _safe_str(data.get("model")).strip() or updated["model"]
+
+        if "temperature" in data:
+            updated["temperature"] = _safe_float(data.get("temperature"), updated["temperature"])
+        if "topP" in data:
+            updated["topP"] = _safe_float(data.get("topP"), updated["topP"])
+        if "contextRounds" in data:
+            updated["contextRounds"] = _safe_int(data.get("contextRounds"), updated["contextRounds"])
+        if "maxOutputTokens" in data:
+            updated["maxOutputTokens"] = _safe_int(data.get("maxOutputTokens"), updated["maxOutputTokens"])
+        if "batchSize" in data:
+            updated["batchSize"] = _safe_int(data.get("batchSize"), updated["batchSize"])
+
+        if "systemPrompt" in data:
+            updated["systemPrompt"] = _safe_str(data.get("systemPrompt"))
+        if "batchSystemPrompt" in data:
+            updated["batchSystemPrompt"] = _safe_str(data.get("batchSystemPrompt"))
+        if "batchUserPromptTemplate" in data:
+            updated["batchUserPromptTemplate"] = _safe_str(data.get("batchUserPromptTemplate"))
+
+        if "hfToken" in data:
+            updated["hfToken"] = _safe_str(data.get("hfToken")).strip()
+        if "hfDataset" in data:
+            updated["hfDataset"] = _safe_str(data.get("hfDataset")).strip()
+
+        self._runtime_defaults = updated
+
+        logger.info(
+            "更新系统默认配置成功: "
+            f"apiHost={updated.get('apiHost')!r}, "
+            f"model={updated.get('model')!r}, "
+            f"batchSystemPrompt_len={len(updated.get('batchSystemPrompt') or '')}, "
+            f"systemPrompt_len={len(updated.get('systemPrompt') or '')}"
+        )
+
+        return {
+            "success": True,
+            "settings": self.get_default_runtime_config()
+        }
+
+    # ==================== 配置解析 ====================
+
+    def _merge_with_defaults(self, config: dict):
+        base = self.get_default_runtime_config()
+        config = config or {}
+
+        merged = copy.deepcopy(base)
+
+        for key, value in config.items():
+            if value is None:
+                continue
+
+            # 对字符串字段，允许空串保留，但后续 prompt fallback 另行处理
+            merged[key] = value
+
+        # 统一类型修正
+        merged["temperature"] = _safe_float(merged.get("temperature"), base["temperature"])
+        merged["topP"] = _safe_float(merged.get("topP"), base["topP"])
+        merged["contextRounds"] = _safe_int(merged.get("contextRounds"), base["contextRounds"])
+        merged["maxOutputTokens"] = _safe_int(merged.get("maxOutputTokens"), base["maxOutputTokens"])
+        merged["batchSize"] = _safe_int(merged.get("batchSize"), base["batchSize"])
+
+        merged["apiHost"] = _safe_str(merged.get("apiHost")).strip()
+        merged["apiKey"] = _safe_str(merged.get("apiKey")).strip()
+        merged["model"] = _safe_str(merged.get("model")).strip() or base["model"]
+
+        merged["systemPrompt"] = _safe_str(merged.get("systemPrompt"))
+        merged["batchSystemPrompt"] = _safe_str(merged.get("batchSystemPrompt"))
+        merged["batchUserPromptTemplate"] = _safe_str(merged.get("batchUserPromptTemplate"))
+
+        merged["hfToken"] = _safe_str(merged.get("hfToken")).strip()
+        merged["hfDataset"] = _safe_str(merged.get("hfDataset")).strip()
+
+        # 关键：批处理 prompt fallback 规则
+        if not merged["batchSystemPrompt"]:
+            merged["batchSystemPrompt"] = merged["systemPrompt"] or DEFAULT_BATCH_SYSTEM_PROMPT
+
+        if not merged["batchUserPromptTemplate"]:
+            merged["batchUserPromptTemplate"] = DEFAULT_BATCH_USER_PROMPT_TEMPLATE
+
         return merged
 
-    def resolve_config_from_id(self, user_id: str, config_id: str = None):
+    def resolve_config_from_id(self, user_id: str, config_id: str):
         """
-        根据 config_id 解析完整配置（含密钥），用于内部调用
+        最终执行配置解析入口：
+        - 没有 configId：返回系统默认配置
+        - 有 configId：从 store 取完整配置，再与默认配置合并
         """
-        from app.stores.conversation_config_store import conversation_config_store
+        user_id = user_id or "default"
+        config_id = _safe_str(config_id).strip()
 
-        default = self.get_full_config()
+        if not config_id:
+            resolved = self._merge_with_defaults({})
+            logger.info(
+                f"resolve_config_from_id: user={user_id}, config_id=<default>, "
+                f"model={resolved.get('model')!r}, "
+                f"batchSystemPrompt_len={len(resolved.get('batchSystemPrompt') or '')}, "
+                f"systemPrompt_len={len(resolved.get('systemPrompt') or '')}"
+            )
+            return resolved
 
-        if not config_id or config_id == "__default__":
-            return default
+        full_cfg = conversation_config_store.get_config_full(user_id, config_id)
+        if not full_cfg:
+            logger.warning(f"resolve_config_from_id: user={user_id}, config_id={config_id!r} 不存在，回退默认配置")
+            resolved = self._merge_with_defaults({})
+            return resolved
 
-        config = conversation_config_store.get_config_full(user_id, config_id)
-        if not config:
-            logger.warning(f"配置 {config_id} 不存在，使用默认配置")
-            return default
+        resolved = self._merge_with_defaults(full_cfg)
 
-        merged = default.copy()
-        for key in [
-            "apiHost",
-            "apiKey",
-            "model",
-            "temperature",
-            "topP",
-            "maxTokens",
-            "maxOutputTokens",
-            "contextRounds",
-            "systemPrompt",
-            "batchSystemPrompt",
-            "batchUserPromptTemplate",
-            "batchSize",
-            "hfToken",
-            "hfDataset",
-        ]:
-            if key in config and config[key]:
-                merged[key] = config[key]
-        return merged
+        logger.info(
+            f"resolve_config_from_id: user={user_id}, config_id={config_id!r}, "
+            f"name={full_cfg.get('name')!r}, "
+            f"apiHost={resolved.get('apiHost')!r}, "
+            f"model={resolved.get('model')!r}, "
+            f"batchSystemPrompt_len={len(resolved.get('batchSystemPrompt') or '')}, "
+            f"systemPrompt_len={len(resolved.get('systemPrompt') or '')}, "
+            f"batchUserPromptTemplate_len={len(resolved.get('batchUserPromptTemplate') or '')}"
+        )
+        return resolved
+
+    def resolve_book_config(self, user_id: str, config_id: str):
+        """
+        语义化别名：一本书执行时解析配置
+        """
+        return self.resolve_config_from_id(user_id, config_id)
+
+    def get_all_safe(self):
+        """
+        兼容旧接口：返回前端可看的安全设置
+        """
+        cfg = self.get_default_runtime_config()
+        safe_cfg = copy.deepcopy(cfg)
+
+        if safe_cfg.get("apiKey"):
+            safe_cfg["apiKeyMasked"] = f"{safe_cfg['apiKey'][:4]}****" if len(safe_cfg["apiKey"]) >= 4 else "****"
+        else:
+            safe_cfg["apiKeyMasked"] = ""
+
+        if safe_cfg.get("hfToken"):
+            safe_cfg["hfTokenMasked"] = f"{safe_cfg['hfToken'][:4]}****" if len(safe_cfg["hfToken"]) >= 4 else "****"
+        else:
+            safe_cfg["hfTokenMasked"] = ""
+
+        # 不直接回明文
+        safe_cfg["apiKey"] = ""
+        safe_cfg["hfToken"] = ""
+
+        return safe_cfg
 
 
 app_settings_service = AppSettingsService()
