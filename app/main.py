@@ -34,13 +34,27 @@ _http_session = http_requests.Session()
 
 # ==================== LLM 调用 ====================
 
-def _call_llm_api(config: dict, messages: list):
+def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
+    """
+    调用LLM API
+    
+    Args:
+        config: 配置字典
+        messages: 消息列表
+        use_stream: 是否使用流式响应
+    
+    Returns:
+        (success, result) - 成功时result是响应JSON，失败时result是错误信息
+    """
     api_host = config.get("apiHost", "").rstrip("/")
     api_key = config.get("apiKey", "")
     model = config.get("model", "gpt-5.4")
     temperature = float(config.get("temperature", 0.7))
     top_p = float(config.get("topP", 0.65))
-    max_tokens = int(config.get("maxOutputTokens", 50000))
+    # max_tokens设置为1M (1000000)，除非用户明确指定较小值
+    max_tokens = int(config.get("maxOutputTokens", 1000000))
+    if max_tokens <= 0:
+        max_tokens = 1000000
 
     url = f"{api_host}/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -53,13 +67,42 @@ def _call_llm_api(config: dict, messages: list):
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
+        "stream": use_stream,  # 启用流式响应
     }
 
+    # 批处理使用更长的超时时间（30分钟），聊天使用较短超时（10分钟）
+    timeout = 1800 if use_stream else 600
+    
     try:
-        resp = _http_session.post(url, headers=headers, json=payload, timeout=300)
-        if resp.status_code == 200:
-            return True, resp.json()
-        return False, f"API错误: {resp.status_code} - {resp.text[:200]}"
+        if use_stream:
+            # 流式响应处理
+            resp = _http_session.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
+            if resp.status_code != 200:
+                return False, f"API错误: {resp.status_code} - {resp.text[:200]}"
+            
+            # 收集流式响应
+            full_content = ""
+            for line in resp.iter_lines():
+                if line:
+                    line = line.decode('utf-8')
+                    if line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            if chunk.get("choices") and chunk["choices"][0].get("delta", {}).get("content"):
+                                full_content += chunk["choices"][0]["delta"]["content"]
+                        except json.JSONDecodeError:
+                            continue
+            
+            return True, {"choices": [{"message": {"content": full_content}}]}
+        else:
+            # 非流式响应（聊天功能使用）
+            resp = _http_session.post(url, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code == 200:
+                return True, resp.json()
+            return False, f"API错误: {resp.status_code} - {resp.text[:200]}"
     except Exception as e:
         return False, str(e)
 
@@ -123,11 +166,22 @@ LLM_MAX_RETRIES = 3
 LLM_RETRY_DELAY = 5  # 秒
 
 
-def _call_llm_api_with_retry(config: dict, messages: list, max_retries: int = LLM_MAX_RETRIES):
-    """带重试机制的 LLM API 调用"""
+def _call_llm_api_with_retry(config: dict, messages: list, max_retries: int = LLM_MAX_RETRIES, use_stream: bool = True):
+    """
+    带重试机制的 LLM API 调用
+    
+    Args:
+        config: 配置字典
+        messages: 消息列表
+        max_retries: 最大重试次数
+        use_stream: 是否使用流式响应（批处理默认使用流式）
+    
+    Returns:
+        (success, result) - 成功时result是响应JSON，失败时result是错误信息
+    """
     last_error = None
     for attempt in range(1, max_retries + 1):
-        success, result = _call_llm_api(config, messages)
+        success, result = _call_llm_api(config, messages, use_stream=use_stream)
         if success:
             return True, result
         last_error = result
