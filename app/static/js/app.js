@@ -22,9 +22,9 @@ const state = {
         maxConcurrent: 10,
         threadPoolSize: 10
     },
-    defaultBatchSize: 10,  // 默认批次大小
-    batchDelayMin: 15,     // 默认最小延迟
-    batchDelayMax: 45      // 默认最大延迟
+    defaultBatchSize: 10,
+    batchDelayMin: 15,
+    batchDelayMax: 45
 };
 
 // ==================== 工具 ====================
@@ -54,13 +54,43 @@ function hideLoading() {
 }
 
 function statusText(s) {
-    return { pending: '等待中', processing: '处理中', completed: '已完成', failed: '失败', cancelled: '已取消', paused: '已暂停' }[s] || s;
+    return {
+        pending: '等待中',
+        queued: '排队中',
+        processing: '处理中',
+        completed: '已完成',
+        partial_failed: '部分失败',
+        failed: '失败',
+        cancelled: '已取消',
+        paused: '已暂停'
+    }[s] || s;
+}
+
+function clampInt(value, defaultValue, minValue = null, maxValue = null) {
+    let n = parseInt(value, 10);
+    if (Number.isNaN(n)) n = defaultValue;
+    if (minValue !== null) n = Math.max(minValue, n);
+    if (maxValue !== null) n = Math.min(maxValue, n);
+    return n;
+}
+
+function normalizeText(text) {
+    return (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function getConfigNameById(configId) {
+    if (!configId) return '默认配置';
+    const cfg = state.configs.find(c => c.id === configId);
+    return cfg ? cfg.name : '默认配置';
 }
 
 // ==================== API ====================
 async function api(path, options = {}) {
     try {
-        const resp = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+        const resp = await fetch(path, {
+            headers: { 'Content-Type': 'application/json' },
+            ...options
+        });
         return await resp.json();
     } catch (e) {
         showToast('网络错误: ' + e.message, 'error');
@@ -73,141 +103,141 @@ function switchPage(page) {
     state.currentPage = page;
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    $(`page-${page}`).classList.add('active');
-    document.querySelector(`.nav-item[data-page="${page}"]`).classList.add('active');
+
+    const pageEl = $(`page-${page}`);
+    if (pageEl) pageEl.classList.add('active');
+
+    const navEl = document.querySelector(`.nav-item[data-page="${page}"]`);
+    if (navEl) navEl.classList.add('active');
+
     if (page === 'tasks') refreshTasks();
     if (page === 'cloud') refreshCloudFiles();
-    if (page === 'settings') { renderServerConfigStatus(); renderDefaultsForm(); refreshConfigs(); loadThreadSettings(); }
+    if (page === 'settings') {
+        renderServerConfigStatus();
+        renderDefaultsForm();
+        refreshConfigs();
+        loadThreadSettings();
+    }
 }
 
 // ==================== 默认配置 ====================
 async function loadServerSettings() {
     const data = await api('/api/settings');
-    if (data.success) state.serverDefaults = data.settings;
+    if (data.success) {
+        state.serverDefaults = data.settings || {};
+        state.defaultBatchSize = clampInt(state.serverDefaults.batchSize || 10, 10, 1, 100);
+        state.batchDelayMin = clampInt(state.serverDefaults.batchDelayMin || 15, 15, 0, 3600);
+        state.batchDelayMax = clampInt(state.serverDefaults.batchDelayMax || 45, 45, state.batchDelayMin, 3600);
+    }
 }
 
 function renderServerConfigStatus() {
     const c = $('serverConfigStatus');
+    if (!c) return;
+
     const items = [
         { label: 'API Key', key: 'hasApiKey' },
         { label: 'HF Token', key: 'hasHfToken' },
         { label: 'HF 数据集', key: 'hfDataset', showVal: true },
     ];
+
     c.innerHTML = items.map(item => {
         const val = state.serverDefaults[item.key];
-        const configured = item.showVal ? !!val : !!val;
         const display = item.showVal ? (val || '未配置') : (val ? '已配置 ✓' : '未配置');
-        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg-primary);border-radius:8px;">
-            <span style="font-size:14px;">${escapeHtml(item.label)}</span>
-            <span class="status-badge ${configured ? 'configured' : 'not-configured'}">
-                <span class="status-dot"></span>${escapeHtml(display)}
-            </span>
-        </div>`;
+        return `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg-primary);border-radius:8px;">
+                <span style="font-size:13px;color:var(--text-secondary);">${item.label}</span>
+                <span style="font-size:13px;">${escapeHtml(display)}</span>
+            </div>
+        `;
     }).join('');
 }
 
 function renderDefaultsForm() {
-    const d = state.serverDefaults;
-    $('defApiHost').value = d.apiHost || '';
-    $('defModel').value = d.model || '';
-    $('defTemperature').value = d.temperature ?? '';
-    $('defTopP').value = d.topP ?? '';
-    $('defContextRounds').value = d.contextRounds ?? '';
-    $('defMaxOutputTokens').value = d.maxOutputTokens ?? '';
-    // 聊天功能系统提示词
-    $('defSystemPrompt').value = d.systemPrompt || '';
-    // 批处理功能提示词
-    $('defBatchSystemPrompt').value = d.batchSystemPrompt || '';
-    $('defBatchUserPromptTemplate').value = d.batchUserPromptTemplate || '';
+    if ($('defaultApiHost')) $('defaultApiHost').value = state.serverDefaults.apiHost || '';
+    if ($('defaultModel')) $('defaultModel').value = state.serverDefaults.model || '';
+    if ($('defaultTemperature')) $('defaultTemperature').value = state.serverDefaults.temperature ?? 0.7;
+    if ($('defaultTopP')) $('defaultTopP').value = state.serverDefaults.topP ?? 0.65;
+    if ($('defaultMaxOutputTokens')) $('defaultMaxOutputTokens').value = state.serverDefaults.maxOutputTokens ?? 50000;
+    if ($('defaultContextRounds')) $('defaultContextRounds').value = state.serverDefaults.contextRounds ?? 100;
+    if ($('defaultSystemPrompt')) $('defaultSystemPrompt').value = state.serverDefaults.systemPrompt || '';
+    if ($('defaultBatchSystemPrompt')) $('defaultBatchSystemPrompt').value = state.serverDefaults.batchSystemPrompt || '';
+    if ($('defaultBatchUserPromptTemplate')) $('defaultBatchUserPromptTemplate').value = state.serverDefaults.batchUserPromptTemplate || '';
+    if ($('globalBatchSize')) $('globalBatchSize').value = state.defaultBatchSize;
+    if ($('globalDelayMin')) $('globalDelayMin').value = state.batchDelayMin;
+    if ($('globalDelayMax')) $('globalDelayMax').value = state.batchDelayMax;
 }
 
 async function saveDefaults() {
+    const payload = {
+        apiHost: $('defaultApiHost')?.value || '',
+        model: $('defaultModel')?.value || '',
+        temperature: $('defaultTemperature')?.value || '',
+        topP: $('defaultTopP')?.value || '',
+        maxOutputTokens: $('defaultMaxOutputTokens')?.value || '',
+        contextRounds: $('defaultContextRounds')?.value || '',
+        systemPrompt: $('defaultSystemPrompt')?.value || '',
+        batchSystemPrompt: $('defaultBatchSystemPrompt')?.value || '',
+        batchUserPromptTemplate: $('defaultBatchUserPromptTemplate')?.value || '',
+    };
+
     const data = await api('/api/settings/update', {
         method: 'POST',
-        body: JSON.stringify({
-            apiHost: $('defApiHost').value.trim(),
-            model: $('defModel').value.trim(),
-            temperature: $('defTemperature').value !== '' ? parseFloat($('defTemperature').value) : '',
-            topP: $('defTopP').value !== '' ? parseFloat($('defTopP').value) : '',
-            contextRounds: $('defContextRounds').value !== '' ? parseInt($('defContextRounds').value) : '',
-            maxOutputTokens: $('defMaxOutputTokens').value !== '' ? parseInt($('defMaxOutputTokens').value) : '',
-            systemPrompt: $('defSystemPrompt').value.trim(),
-            batchSystemPrompt: $('defBatchSystemPrompt').value.trim(),
-            batchUserPromptTemplate: $('defBatchUserPromptTemplate').value.trim(),
-        }),
+        body: JSON.stringify(payload)
     });
+
     if (data.success) {
-        state.serverDefaults = data.settings;
+        state.serverDefaults = data.settings || {};
         showToast('默认配置已保存', 'success');
+        renderServerConfigStatus();
     } else {
         showToast('保存失败: ' + (data.error || ''), 'error');
     }
 }
 
-// ==================== 线程池设置 ====================
+// ==================== 线程设置 ====================
 async function loadThreadSettings() {
     const data = await api('/api/status');
     if (data.success) {
-        state.threadSettings.maxConcurrent = data.maxConcurrent;
-        state.threadSettings.threadPoolSize = data.threadPoolSize;
-        state.defaultBatchSize = data.batchSize || 10;
-        state.batchDelayMin = data.batchDelayMin || 15;
-        state.batchDelayMax = data.batchDelayMax || 45;
-        $('maxConcurrent').value = data.maxConcurrent;
-        $('threadPoolSize').value = data.threadPoolSize;
-        // 更新延迟输入框
-        if ($('batchDelayMin')) $('batchDelayMin').value = state.batchDelayMin;
-        if ($('batchDelayMax')) $('batchDelayMax').value = state.batchDelayMax;
-        // 更新批处理页面的延迟输入框
-        if ($('globalDelayMin')) $('globalDelayMin').value = state.batchDelayMin;
-        if ($('globalDelayMax')) $('globalDelayMax').value = state.batchDelayMax;
+        state.threadSettings.maxConcurrent = data.maxConcurrent || 10;
+        state.threadSettings.threadPoolSize = data.threadPoolSize || 10;
+        if ($('maxConcurrentInput')) $('maxConcurrentInput').value = state.threadSettings.maxConcurrent;
+        if ($('threadPoolSizeInput')) $('threadPoolSizeInput').value = state.threadSettings.threadPoolSize;
+        if ($('globalBatchSize')) $('globalBatchSize').value = data.batchSize || state.defaultBatchSize;
+        if ($('globalDelayMin')) $('globalDelayMin').value = data.batchDelayMin || state.batchDelayMin;
+        if ($('globalDelayMax')) $('globalDelayMax').value = data.batchDelayMax || state.batchDelayMax;
     }
 }
 
 async function saveThreadSettings() {
-    const maxConcurrent = parseInt($('maxConcurrent').value) || 10;
-    const threadPoolSize = parseInt($('threadPoolSize').value) || 10;
-    
-    // 保存并发数
-    const data1 = await api('/api/set-concurrent', {
+    const maxConcurrent = clampInt($('maxConcurrentInput')?.value || 10, 10, 1, 50);
+    const threadPoolSize = clampInt($('threadPoolSizeInput')?.value || 10, 10, 1, 100);
+    const delayMin = clampInt($('globalDelayMin')?.value || state.batchDelayMin, state.batchDelayMin, 0, 3600);
+    const delayMax = clampInt($('globalDelayMax')?.value || state.batchDelayMax, state.batchDelayMax, delayMin, 3600);
+
+    const r1 = await api('/api/set-concurrent', {
         method: 'POST',
-        body: JSON.stringify({ maxConcurrent }),
+        body: JSON.stringify({ maxConcurrent })
     });
-    
-    // 保存线程池大小
-    const data2 = await api('/api/set-thread-pool', {
+
+    const r2 = await api('/api/set-thread-pool', {
         method: 'POST',
-        body: JSON.stringify({ threadPoolSize }),
+        body: JSON.stringify({ threadPoolSize })
     });
-    
-    if (data1.success && data2.success) {
+
+    const r3 = await api('/api/set-batch-delay', {
+        method: 'POST',
+        body: JSON.stringify({ delayMin, delayMax })
+    });
+
+    if (r1.success && r2.success && r3.success) {
         state.threadSettings.maxConcurrent = maxConcurrent;
         state.threadSettings.threadPoolSize = threadPoolSize;
-        $('threadStatus').textContent = '已保存 ✓';
-        showToast('线程池设置已保存', 'success');
-        setTimeout(() => { $('threadStatus').textContent = ''; }, 2000);
+        state.batchDelayMin = delayMin;
+        state.batchDelayMax = delayMax;
+        showToast('线程与批处理设置已保存', 'success');
     } else {
-        showToast('保存失败', 'error');
-    }
-}
-
-async function saveDelaySettings() {
-    const delayMin = parseInt($('batchDelayMin').value) || 15;
-    const delayMax = parseInt($('batchDelayMax').value) || 45;
-    
-    const data = await api('/api/set-batch-delay', {
-        method: 'POST',
-        body: JSON.stringify({ delayMin, delayMax }),
-    });
-    
-    if (data.success) {
-        state.batchDelayMin = data.batchDelayMin;
-        state.batchDelayMax = data.batchDelayMax;
-        $('delayStatus').textContent = '已保存 ✓';
-        showToast('延迟设置已保存', 'success');
-        setTimeout(() => { $('delayStatus').textContent = ''; }, 2000);
-    } else {
-        showToast('保存失败', 'error');
+        showToast('设置保存失败', 'error');
     }
 }
 
@@ -217,279 +247,414 @@ async function refreshConfigs() {
     if (data.success) {
         state.configs = data.configs || [];
         renderConfigList();
-        updateConfigSelects();
+        renderBatchFiles();
+        renderConversationConfigOptions();
     }
-}
-
-function updateConfigSelects() {
-    // 聊天页
-    const sel = $('chatConfigSelect');
-    const currentVal = sel.value;
-    sel.innerHTML = '<option value="">默认配置</option>';
-    state.configs.forEach(c => {
-        sel.innerHTML += `<option value="${c.id}">${escapeHtml(c.name)}</option>`;
-    });
-    sel.value = currentVal;
-
-    // 批处理文件卡片
-    document.querySelectorAll('.batch-config-select').forEach(sel => {
-        const fileId = sel.dataset.fileId;
-        const current = sel.value;
-        sel.innerHTML = '<option value="">默认配置</option>';
-        state.configs.forEach(c => {
-            sel.innerHTML += `<option value="${c.id}">${escapeHtml(c.name)}</option>`;
-        });
-        sel.value = current;
-    });
 }
 
 function renderConfigList() {
     const c = $('configList');
+    if (!c) return;
+
     if (state.configs.length === 0) {
-        c.innerHTML = '<p style="color:var(--text-muted);font-size:13px;">暂无配置，点击右上角新建</p>';
+        c.innerHTML = `<div style="font-size:13px;color:var(--text-muted);">暂无配置</div>`;
         return;
     }
-    c.innerHTML = state.configs.map(cfg => {
-        const badges = [];
-        if (cfg.hasApiKey) badges.push('🔑 API');
-        if (cfg.hasHfToken) badges.push('☁️ HF');
-        if (cfg.hfDataset) badges.push('📦 ' + cfg.hfDataset);
-        if (cfg.systemPrompt || cfg.batchSystemPrompt) badges.push('📝 提示词');
-        if (cfg.batchSize) badges.push('📚 批次:' + cfg.batchSize);
-        const diff = [];
-        if (cfg.model && cfg.model !== state.serverDefaults.model) diff.push('模型');
-        if (cfg.temperature !== '' && cfg.temperature !== state.serverDefaults.temperature) diff.push('Temp');
-        if (diff.length) badges.push('⚙️ ' + diff.join(','));
-        return `<div class="config-item" onclick="editConfig('${cfg.id}')">
+
+    c.innerHTML = state.configs.map(cfg => `
+        <div class="task-item">
             <div>
-                <div class="name">${escapeHtml(cfg.name)}</div>
-                <div class="desc">${badges.join(' · ') || '使用默认配置'}</div>
+                <div style="font-weight:600;">${escapeHtml(cfg.name || '未命名配置')}</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    model: ${escapeHtml(cfg.model || '')}
+                    ${cfg.hasApiKey ? ' · API Key ✓' : ''}
+                    ${cfg.hasHfToken ? ' · HF Token ✓' : ''}
+                </div>
             </div>
-            <span style="color:var(--text-muted);font-size:12px;">点击编辑</span>
-        </div>`;
-    }).join('');
+            <div style="display:flex;gap:8px;">
+                <button class="btn btn-sm btn-secondary" onclick="editConfig('${cfg.id}')">编辑</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteConfig('${cfg.id}')">删除</button>
+            </div>
+        </div>
+    `).join('');
 }
 
-function openConfigModal(configId = null) {
+function clearConfigForm() {
+    state.editingConfigId = null;
+    if ($('configName')) $('configName').value = '';
+    if ($('configSystemPrompt')) $('configSystemPrompt').value = '';
+    if ($('configBatchSystemPrompt')) $('configBatchSystemPrompt').value = '';
+    if ($('configBatchUserPromptTemplate')) $('configBatchUserPromptTemplate').value = '';
+    if ($('configBatchSize')) $('configBatchSize').value = '';
+    if ($('configModel')) $('configModel').value = '';
+    if ($('configTemperature')) $('configTemperature').value = '';
+    if ($('configTopP')) $('configTopP').value = '';
+    if ($('configContextRounds')) $('configContextRounds').value = '';
+    if ($('configApiHost')) $('configApiHost').value = '';
+    if ($('configApiKey')) $('configApiKey').value = '';
+    if ($('configMaxOutputTokens')) $('configMaxOutputTokens').value = '';
+    if ($('configHfToken')) $('configHfToken').value = '';
+    if ($('configHfDataset')) $('configHfDataset').value = '';
+}
+
+function editConfig(configId) {
+    const cfg = state.configs.find(c => c.id === configId);
+    if (!cfg) return;
     state.editingConfigId = configId;
-    $('configModalTitle').textContent = configId ? '编辑配置' : '新建配置';
-    $('btnDeleteConfig').style.display = configId ? 'inline-flex' : 'none';
 
-    // 默认值（从 serverDefaults 取）
-    const d = state.serverDefaults;
+    if ($('configName')) $('configName').value = cfg.name || '';
+    if ($('configSystemPrompt')) $('configSystemPrompt').value = cfg.systemPrompt || '';
+    if ($('configBatchSystemPrompt')) $('configBatchSystemPrompt').value = cfg.batchSystemPrompt || '';
+    if ($('configBatchUserPromptTemplate')) $('configBatchUserPromptTemplate').value = cfg.batchUserPromptTemplate || '';
+    if ($('configBatchSize')) $('configBatchSize').value = cfg.batchSize || '';
+    if ($('configModel')) $('configModel').value = cfg.model || '';
+    if ($('configTemperature')) $('configTemperature').value = cfg.temperature || '';
+    if ($('configTopP')) $('configTopP').value = cfg.topP || '';
+    if ($('configContextRounds')) $('configContextRounds').value = cfg.contextRounds || '';
+    if ($('configApiHost')) $('configApiHost').value = cfg.apiHost || '';
+    if ($('configApiKey')) $('configApiKey').value = '';
+    if ($('configMaxOutputTokens')) $('configMaxOutputTokens').value = cfg.maxOutputTokens || '';
+    if ($('configHfToken')) $('configHfToken').value = '';
+    if ($('configHfDataset')) $('configHfDataset').value = cfg.hfDataset || '';
 
-    if (configId) {
-        const cfg = state.configs.find(c => c.id === configId);
-        if (cfg) {
-            $('cfgName').value = cfg.name || '';
-            // 聊天功能提示词
-            $('cfgSystemPrompt').value = cfg.systemPrompt || '';
-            $('cfgContextRounds').value = cfg.contextRounds || '';
-            $('cfgMaxOutputTokens').value = cfg.maxOutputTokens || '';
-            // 批处理功能提示词
-            $('cfgBatchSystemPrompt').value = cfg.batchSystemPrompt || '';
-            $('cfgBatchUserPromptTemplate').value = cfg.batchUserPromptTemplate || '';
-            $('cfgBatchSize').value = cfg.batchSize || '';
-            // API配置
-            $('cfgApiHost').value = cfg.apiHost || '';
-            $('cfgApiKey').value = '';
-            $('cfgModel').value = cfg.model || '';
-            $('cfgTemperature').value = cfg.temperature ?? '';
-            $('cfgTopP').value = cfg.topP ?? '';
-            // HF配置
-            $('cfgHfToken').value = '';
-            $('cfgHfDataset').value = cfg.hfDataset || '';
-            $('configModal').classList.remove('hidden');
-            return;
-        }
-    }
-
-    // 新建配置：预填默认值（除敏感字段）
-    $('cfgName').value = '';
-    // 聊天功能提示词
-    $('cfgSystemPrompt').value = d.systemPrompt || '';
-    $('cfgContextRounds').value = d.contextRounds || '';
-    $('cfgMaxOutputTokens').value = d.maxOutputTokens || '';
-    // 批处理功能提示词
-    $('cfgBatchSystemPrompt').value = d.batchSystemPrompt || '';
-    $('cfgBatchUserPromptTemplate').value = d.batchUserPromptTemplate || '';
-    $('cfgBatchSize').value = state.defaultBatchSize || 10;
-    // API配置
-    $('cfgApiHost').value = '';
-    $('cfgApiKey').value = '';
-    $('cfgModel').value = d.model || '';
-    $('cfgTemperature').value = d.temperature ?? '';
-    $('cfgTopP').value = d.topP ?? '';
-    // HF配置
-    $('cfgHfToken').value = '';
-    $('cfgHfDataset').value = '';
-    $('configModal').classList.remove('hidden');
+    showToast('已加载配置到编辑区', 'info');
 }
-
-function editConfig(id) { openConfigModal(id); }
 
 async function saveConfig() {
-    const name = $('cfgName').value.trim();
-    if (!name) { showToast('请输入配置名称', 'warning'); return; }
+    const payload = {
+        userId: 'default',
+        id: state.editingConfigId || '',
+        name: $('configName')?.value || '未命名配置',
+        systemPrompt: $('configSystemPrompt')?.value || '',
+        batchSystemPrompt: $('configBatchSystemPrompt')?.value || '',
+        batchUserPromptTemplate: $('configBatchUserPromptTemplate')?.value || '',
+        batchSize: $('configBatchSize')?.value || '',
+        model: $('configModel')?.value || '',
+        temperature: $('configTemperature')?.value || '',
+        topP: $('configTopP')?.value || '',
+        contextRounds: $('configContextRounds')?.value || '',
+        apiHost: $('configApiHost')?.value || '',
+        apiKey: $('configApiKey')?.value || '',
+        maxOutputTokens: $('configMaxOutputTokens')?.value || '',
+        hfToken: $('configHfToken')?.value || '',
+        hfDataset: $('configHfDataset')?.value || '',
+    };
 
     const data = await api('/api/config/save', {
         method: 'POST',
-        body: JSON.stringify({
-            userId: 'default',
-            id: state.editingConfigId,
-            name,
-            // 聊天功能提示词
-            systemPrompt: $('cfgSystemPrompt').value.trim(),
-            contextRounds: $('cfgContextRounds').value !== '' ? parseInt($('cfgContextRounds').value) : '',
-            maxOutputTokens: $('cfgMaxOutputTokens').value !== '' ? parseInt($('cfgMaxOutputTokens').value) : '',
-            // 批处理功能提示词
-            batchSystemPrompt: $('cfgBatchSystemPrompt').value.trim(),
-            batchUserPromptTemplate: $('cfgBatchUserPromptTemplate').value.trim(),
-            batchSize: $('cfgBatchSize').value !== '' ? parseInt($('cfgBatchSize').value) : '',
-            // API配置
-            apiHost: $('cfgApiHost').value.trim(),
-            apiKey: $('cfgApiKey').value.trim(),
-            model: $('cfgModel').value.trim(),
-            temperature: $('cfgTemperature').value !== '' ? parseFloat($('cfgTemperature').value) : '',
-            topP: $('cfgTopP').value !== '' ? parseFloat($('cfgTopP').value) : '',
-            // HF配置
-            hfToken: $('cfgHfToken').value.trim(),
-            hfDataset: $('cfgHfDataset').value.trim(),
-        }),
+        body: JSON.stringify(payload)
     });
 
     if (data.success) {
-        showToast('配置已保存', 'success');
-        $('configModal').classList.add('hidden');
-        await refreshConfigs();
+        showToast('配置保存成功', 'success');
+        clearConfigForm();
+        refreshConfigs();
     } else {
-        showToast('保存失败: ' + (data.error || ''), 'error');
+        showToast('保存配置失败: ' + (data.error || ''), 'error');
     }
 }
 
-async function deleteConfig() {
-    if (!state.editingConfigId) return;
-    if (!confirm('确定删除此配置？')) return;
+async function deleteConfig(configId) {
     const data = await api('/api/config/delete', {
         method: 'POST',
-        body: JSON.stringify({ userId: 'default', id: state.editingConfigId }),
+        body: JSON.stringify({ userId: 'default', id: configId })
     });
+
     if (data.success) {
-        showToast('已删除', 'success');
-        $('configModal').classList.add('hidden');
-        await refreshConfigs();
+        showToast('配置已删除', 'success');
+        refreshConfigs();
+    } else {
+        showToast('删除失败: ' + (data.error || ''), 'error');
     }
 }
 
-// ==================== 聊天 ====================
+// ==================== 对话 ====================
 async function loadConversations() {
     const data = await api('/api/conversations?userId=default');
-    if (data.success) state.conversations = data.conversations || [];
+    if (data.success) {
+        state.conversations = Object.values(data.conversations || {});
+        renderConversationList();
+        if (!state.currentConvId && state.conversations.length > 0) {
+            state.currentConvId = state.conversations[0].id;
+            renderCurrentConversation();
+        }
+    }
+}
+
+function renderConversationList() {
+    const c = $('conversationList');
+    if (!c) return;
+
+    c.innerHTML = state.conversations.map(conv => `
+        <div class="task-item" style="cursor:pointer;${state.currentConvId === conv.id ? 'border-color:var(--primary);' : ''}" onclick="selectConversation('${conv.id}')">
+            <div style="flex:1;min-width:0;">
+                <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(conv.title || '新对话')}</div>
+            </div>
+            <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteConversation('${conv.id}')">删除</button>
+        </div>
+    `).join('');
+}
+
+function renderConversationConfigOptions() {
+    const select = $('chatConfigSelect');
+    if (!select) return;
+
+    select.innerHTML = `
+        <option value="">默认配置</option>
+        ${state.configs.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('')}
+    `;
+}
+
+function selectConversation(convId) {
+    state.currentConvId = convId;
+    renderConversationList();
+    renderCurrentConversation();
+}
+
+function renderCurrentConversation() {
+    const wrap = $('chatMessages');
+    if (!wrap) return;
+
+    const conv = state.conversations.find(c => c.id === state.currentConvId);
+    if (!conv) {
+        wrap.innerHTML = `<div style="color:var(--text-muted);font-size:14px;">暂无对话</div>`;
+        return;
+    }
+
+    const msgs = conv.messages || [];
+    wrap.innerHTML = msgs.map(msg => `
+        <div class="chat-message ${msg.role}">
+            <div class="chat-avatar">${msg.role === 'user' ? '我' : 'AI'}</div>
+            <div class="chat-bubble">${escapeHtml(msg.content || '')}</div>
+        </div>
+    `).join('');
+
+    wrap.scrollTop = wrap.scrollHeight;
 }
 
 async function createConversation() {
-    const configId = $('chatConfigSelect').value;
-    const configName = $('chatConfigSelect').selectedOptions[0]?.textContent || '默认配置';
     const data = await api('/api/conversation/create', {
         method: 'POST',
-        body: JSON.stringify({ userId: 'default', title: configName, configId }),
+        body: JSON.stringify({
+            userId: 'default',
+            title: '新对话',
+            configId: $('chatConfigSelect')?.value || ''
+        })
     });
+
     if (data.success) {
-        state.currentConvId = data.conversation.id;
         await loadConversations();
-        renderChatMessages();
+        state.currentConvId = data.conversation.id;
+        renderConversationList();
+        renderCurrentConversation();
     }
 }
 
-async function sendMessage() {
+async function deleteConversation(convId) {
+    const data = await api('/api/conversation/delete', {
+        method: 'POST',
+        body: JSON.stringify({ userId: 'default', id: convId })
+    });
+
+    if (data.success) {
+        if (state.currentConvId === convId) state.currentConvId = null;
+        await loadConversations();
+    }
+}
+
+async function sendChat() {
+    if (state.isSending) return;
     const input = $('chatInput');
-    const message = input.value.trim();
-    if (!message || state.isSending) return;
+    if (!input) return;
+
+    const message = (input.value || '').trim();
+    if (!message) return;
 
     if (!state.currentConvId) {
         await createConversation();
-        if (!state.currentConvId) return;
     }
 
     state.isSending = true;
-    $('btnSendMessage').disabled = true;
     input.value = '';
-    input.style.height = 'auto';
 
-    appendChatBubble('user', message);
-    appendChatBubble('assistant', '思考中...', true);
-
-    const configId = $('chatConfigSelect').value;
     const data = await api('/api/chat', {
         method: 'POST',
         body: JSON.stringify({
             userId: 'default',
             conversationId: state.currentConvId,
             message,
-            configId,
-        }),
+            configId: $('chatConfigSelect')?.value || ''
+        })
     });
 
-    const thinking = document.querySelector('.chat-message.assistant .chat-bubble.loading-bubble');
-    if (thinking) thinking.closest('.chat-message').remove();
+    state.isSending = false;
 
     if (data.success) {
-        appendChatBubble('assistant', data.message);
+        await loadConversations();
+        renderCurrentConversation();
     } else {
-        appendChatBubble('assistant', '❌ ' + (data.error || '请求失败'));
+        showToast('发送失败: ' + (data.error || ''), 'error');
     }
-
-    state.isSending = false;
-    $('btnSendMessage').disabled = false;
-    input.focus();
 }
 
-function appendChatBubble(role, content, isLoading = false) {
-    const container = $('chatMessages');
-    const empty = container.querySelector('.empty-state');
-    if (empty) empty.remove();
+// ==================== 章节解析（本地） ====================
 
-    const div = document.createElement('div');
-    div.className = `chat-message ${role}`;
-    div.innerHTML = `
-        <div class="chat-avatar">${role === 'user' ? '👤' : '🤖'}</div>
-        <div class="chat-bubble${isLoading ? ' loading-bubble' : ''}">${escapeHtml(content)}</div>
-    `;
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
+const SPECIAL_CHAPTER_TITLES = new Set([
+    '序章', '序', '楔子', '引子', '前言', '正文',
+    '终章', '尾声', '后记', '番外', '番外篇', '完结感言'
+]);
+
+const STRONG_CHAPTER_PATTERNS = [
+    /^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s*(?:[：:·\-—.．、]\s*.*)?$/i,
+    /^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s+.*$/i,
+    /^chapter\s*\d+\s*(?:[:：.\-—]\s*.*)?$/i,
+    /^chapter\s*[ivxlcdm]+\s*(?:[:：.\-—]\s*.*)?$/i,
+];
+
+const WEAK_CHAPTER_PATTERNS = [
+    /^\d+\s*[、.．\-—]\s*.+$/i,
+    /^\d+\s+.+$/i,
+];
+
+function normalizeChapterLine(line) {
+    return (line || '')
+        .replace(/\uFEFF/g, '')
+        .replace(/\u3000/g, ' ')
+        .trim()
+        .replace(/\s+/g, ' ');
 }
 
-function renderChatMessages() {
-    const container = $('chatMessages');
-    container.innerHTML = '';
-    if (!state.currentConvId) {
-        container.innerHTML = '<div class="empty-state"><div class="icon">💬</div><p>选择配置，开始新对话</p></div>';
-        return;
-    }
-    const conv = state.conversations.find(c => c.id === state.currentConvId);
-    if (!conv || !conv.messages || conv.messages.length === 0) {
-        container.innerHTML = '<div class="empty-state"><div class="icon">💬</div><p>开始新对话吧</p></div>';
-        return;
-    }
-    conv.messages.forEach(msg => appendChatBubble(msg.role, msg.content));
-    container.scrollTop = container.scrollHeight;
+function isSpecialChapterTitle(line) {
+    return SPECIAL_CHAPTER_TITLES.has(normalizeChapterLine(line));
 }
 
-// ==================== 批处理（多文件） ====================
+function isStrongChapterTitle(line) {
+    const normalized = normalizeChapterLine(line);
+    if (!normalized) return false;
+    if (isSpecialChapterTitle(normalized)) return true;
+    if (normalized.length > 80) return false;
+    return STRONG_CHAPTER_PATTERNS.some(pattern => pattern.test(normalized));
+}
+
+function isWeakChapterTitle(line) {
+    const normalized = normalizeChapterLine(line);
+    if (!normalized) return false;
+    if (normalized.length > 60) return false;
+    return WEAK_CHAPTER_PATTERNS.some(pattern => pattern.test(normalized));
+}
+
+function collectFollowingTextLength(lines, startIndex, maxLookahead = 8) {
+    let totalLen = 0;
+    for (let i = startIndex + 1; i < Math.min(lines.length, startIndex + 1 + maxLookahead); i++) {
+        const text = normalizeChapterLine(lines[i]);
+        if (!text) continue;
+        if (isStrongChapterTitle(text)) break;
+        totalLen += text.length;
+    }
+    return totalLen;
+}
+
+function countChapterSignalLines(lines) {
+    let strongCount = 0;
+    let weakCount = 0;
+    for (const line of lines) {
+        const normalized = normalizeChapterLine(line);
+        if (!normalized) continue;
+        if (isStrongChapterTitle(normalized)) strongCount++;
+        else if (isWeakChapterTitle(normalized)) weakCount++;
+    }
+    return { strongCount, weakCount };
+}
+
+function isChapterTitleWithContext(lines, index, strongCount, weakCount) {
+    const normalized = normalizeChapterLine(lines[index]);
+    if (!normalized) return false;
+
+    if (isStrongChapterTitle(normalized)) return true;
+    if (!isWeakChapterTitle(normalized)) return false;
+
+    const followingLen = collectFollowingTextLength(lines, index, 8);
+    if (followingLen >= 12) return true;
+    if (weakCount >= 3) return true;
+    if (/^\d+\s*[、.．\-—]\s*.+$/i.test(normalized)) return true;
+    if (strongCount + weakCount >= 2 && /^\d+\s+.+$/i.test(normalized)) return true;
+
+    return false;
+}
 
 /**
- * 高性能批处理文件处理
- * - 使用Web Worker并行解析
- * - 实时进度显示
+ * 本地解析章节
+ * 当前版本在主线程中解析，规则已与后端尽量保持一致。
+ */
+function parseChaptersLocal(content) {
+    const safeContent = normalizeText(content);
+    if (!safeContent) return [];
+
+    const lines = safeContent.split('\n');
+    const { strongCount, weakCount } = countChapterSignalLines(lines);
+
+    const chapters = [];
+    let currentChapter = null;
+    let currentLines = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const stripped = normalizeChapterLine(rawLine);
+
+        if (!stripped) {
+            if (currentChapter !== null) currentLines.push(rawLine);
+            continue;
+        }
+
+        if (isChapterTitleWithContext(lines, i, strongCount, weakCount)) {
+            if (currentChapter !== null) {
+                const chapterText = currentLines.join('\n').trim();
+                if (chapterText) {
+                    chapters.push({
+                        title: currentChapter,
+                        content: chapterText,
+                        index: chapters.length + 1
+                    });
+                }
+            }
+            currentChapter = stripped;
+            currentLines = [];
+        } else {
+            if (currentChapter !== null) currentLines.push(rawLine);
+        }
+    }
+
+    if (currentChapter !== null) {
+        const chapterText = currentLines.join('\n').trim();
+        if (chapterText) {
+            chapters.push({
+                title: currentChapter,
+                content: chapterText,
+                index: chapters.length + 1
+            });
+        }
+    }
+
+    return chapters;
+}
+
+// ==================== 批处理文件 ====================
+
+function buildLocalBatchFileFingerprint(fileName, chapters) {
+    return `${fileName}::${chapters.length}`;
+}
+
+/**
+ * 批处理文件解析
+ * 当前版本使用主线程 FileReader + 本地章节解析。
  */
 async function handleBatchFiles(files) {
-    const txtFiles = Array.from(files).filter(f => f.name.endsWith('.txt'));
+    const txtFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.txt'));
     if (txtFiles.length === 0) {
         showToast('请选择.txt文件', 'warning');
         return;
     }
-    
-    // 显示进度条
+
     const progressContainer = document.createElement('div');
     progressContainer.id = 'batchProgress';
     progressContainer.innerHTML = `
@@ -505,146 +670,95 @@ async function handleBatchFiles(files) {
         </div>
     `;
     document.body.appendChild(progressContainer);
-    
+
     const progressBar = $('batchProgressBar');
     const progressText = $('batchProgressText');
     const progressFiles = $('batchProgressFiles');
-    
+
     let completed = 0;
-    const results = [];
-    
-    // 使用Web Worker并行解析
-    const parsePromises = txtFiles.map((file, index) => {
+
+    const parsePromises = txtFiles.map((file) => {
         return new Promise((resolve) => {
             const reader = new FileReader();
+
             reader.onload = (e) => {
-                // 在主线程中解析（比后端快）
-                const chapters = parseChaptersLocal(e.target.result);
+                const content = e.target.result || '';
+                const chapters = parseChaptersLocal(content);
                 completed++;
-                
-                // 更新进度
+
                 const percent = Math.round((completed / txtFiles.length) * 100);
                 progressBar.style.width = percent + '%';
                 progressText.textContent = `${completed}/${txtFiles.length}`;
-                progressFiles.innerHTML = `<div class="progress-file">✓ ${file.name}: ${chapters.length} 章</div>` + progressFiles.innerHTML;
-                
+                progressFiles.innerHTML = `<div class="progress-file">✓ ${escapeHtml(file.name)}: ${chapters.length} 章</div>` + progressFiles.innerHTML;
+
                 resolve({
                     fileName: file.name,
-                    chapters: chapters,
+                    chapters,
                     success: chapters.length > 0
                 });
             };
+
             reader.onerror = () => {
                 completed++;
                 progressBar.style.width = Math.round((completed / txtFiles.length) * 100) + '%';
                 progressText.textContent = `${completed}/${txtFiles.length}`;
-                progressFiles.innerHTML = `<div class="progress-file error">✗ ${file.name}: 读取失败</div>` + progressFiles.innerHTML;
-                resolve({ fileName: file.name, chapters: [], success: false });
+                progressFiles.innerHTML = `<div class="progress-file error">✗ ${escapeHtml(file.name)}: 读取失败</div>` + progressFiles.innerHTML;
+                resolve({
+                    fileName: file.name,
+                    chapters: [],
+                    success: false
+                });
             };
+
             reader.readAsText(file);
         });
     });
-    
-    // 并行执行所有解析
-    const allResults = await Promise.all(parsePromises);
-    
-    // 移除进度条
-    document.body.removeChild(progressContainer);
-    
-    // 添加成功的文件到列表
-    let successCount = 0;
-    allResults.forEach(result => {
-        if (result.success && result.chapters.length > 0) {
-            const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
-            state.batchFiles.push({
-                fileId,
-                fileName: result.fileName,
-                chapters: result.chapters,
-                configId: '',
-                batchSize: state.defaultBatchSize,
-            });
-            successCount++;
-        }
-    });
-    
-    renderBatchFiles();
-    showToast(`成功解析 ${successCount}/${txtFiles.length} 个文件`, successCount > 0 ? 'success' : 'warning');
-}
 
-/**
- * 本地解析章节 - 高性能版本
- * 直接在浏览器中解析，无需后端
- */
-function parseChaptersLocal(content) {
-    const chapters = [];
-    const lines = content.split('\n');
-    let currentChapter = null;
-    let currentLines = [];
-    let chapterIndex = 0;
-    
-    // 章节标题匹配模式
-    const patterns = [
-        /^[第]\s*([零一二三四五六七八九十百千万\d]+)\s*[章节回卷集部篇]\s*[：:．.\s]*\S+/,
-        /^Chapter\s*\d+/i,
-        /^CHAPTER\s*\d+/,
-        /^\d+[、.．]\s*\S+/,
-    ];
-    
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const stripped = line.trim();
-        
-        if (!stripped) {
-            if (currentChapter !== null) currentLines.push(line);
-            continue;
-        }
-        
-        let isChapterTitle = false;
-        for (const pattern of patterns) {
-            if (pattern.test(stripped)) {
-                isChapterTitle = true;
-                break;
-            }
-        }
-        
-        if (isChapterTitle) {
-            if (currentChapter !== null) {
-                const chapterText = currentLines.join('\n').trim();
-                if (chapterText) {
-                    chapterIndex++;
-                    chapters.push({
-                        title: currentChapter,
-                        content: chapterText,
-                        index: chapterIndex
-                    });
-                }
-            }
-            currentChapter = stripped;
-            currentLines = [];
-        } else {
-            if (currentChapter !== null) currentLines.push(line);
-        }
+    const allResults = await Promise.all(parsePromises);
+
+    if (progressContainer.parentNode) {
+        document.body.removeChild(progressContainer);
     }
-    
-    // 最后一章
-    if (currentChapter !== null) {
-        const chapterText = currentLines.join('\n').trim();
-        if (chapterText) {
-            chapterIndex++;
-            chapters.push({
-                title: currentChapter,
-                content: chapterText,
-                index: chapterIndex
-            });
+
+    let successCount = 0;
+    let duplicateCount = 0;
+
+    allResults.forEach(result => {
+        if (!result.success || result.chapters.length === 0) return;
+
+        const localFingerprint = buildLocalBatchFileFingerprint(result.fileName, result.chapters);
+        const exists = state.batchFiles.some(f => f.localFingerprint === localFingerprint);
+
+        if (exists) {
+            duplicateCount++;
+            return;
         }
-    }
-    
-    return chapters;
+
+        const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        state.batchFiles.push({
+            fileId,
+            localFingerprint,
+            fileName: result.fileName,
+            chapters: result.chapters,
+            configId: '',
+            batchSize: state.defaultBatchSize,
+            startChapter: 1,
+            endChapter: result.chapters.length
+        });
+        successCount++;
+    });
+
+    renderBatchFiles();
+
+    let msg = `成功解析 ${successCount}/${txtFiles.length} 个文件`;
+    if (duplicateCount > 0) msg += `，跳过本地重复 ${duplicateCount} 个`;
+    showToast(msg, successCount > 0 ? 'success' : 'warning');
 }
 
 function renderBatchFiles() {
     const container = $('batchFileList');
     const submitArea = $('batchSubmitArea');
+    if (!container || !submitArea) return;
 
     if (state.batchFiles.length === 0) {
         container.innerHTML = '';
@@ -653,33 +767,81 @@ function renderBatchFiles() {
     }
 
     submitArea.classList.remove('hidden');
-    const totalChapters = state.batchFiles.reduce((sum, f) => sum + f.chapters.length, 0);
 
-    container.innerHTML = state.batchFiles.map(f => `
+    const totalChapters = state.batchFiles.reduce((sum, f) => sum + (f.chapters?.length || 0), 0);
+
+    container.innerHTML = state.batchFiles.map(f => {
+        const total = f.chapters.length;
+        const start = clampInt(f.startChapter || 1, 1, 1, Math.max(1, total));
+        const end = clampInt(f.endChapter || total, total, 1, Math.max(1, total));
+        const rangeCount = Math.max(0, Math.abs(end - start) + 1);
+
+        return `
         <div class="batch-file-card" data-file-id="${f.fileId}">
             <div class="batch-file-header">
                 <div>
                     <div class="batch-file-name">📄 ${escapeHtml(f.fileName)}</div>
-                    <div class="batch-file-meta">${f.chapters.length} 个章节</div>
+                    <div class="batch-file-meta">
+                        总章节：${total} · 当前范围：${start} ~ ${end}（${rangeCount}章）
+                    </div>
                 </div>
                 <button class="btn btn-sm btn-danger" onclick="removeBatchFile('${f.fileId}')">✕ 移除</button>
             </div>
+
             <div class="batch-file-config">
                 <label>使用配置:</label>
-                <select class="form-input batch-config-select" data-file-id="${f.fileId}" onchange="updateBatchFileConfig('${f.fileId}', this.value)">
+                <select class="form-input" onchange="updateBatchFileConfig('${f.fileId}', this.value)">
                     <option value="">默认配置</option>
                     ${state.configs.map(c => `<option value="${c.id}" ${f.configId === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
                 </select>
             </div>
+
             <div class="batch-file-config">
                 <label>批次大小:</label>
-                <input type="number" class="form-input batch-size-input" data-file-id="${f.fileId}" 
-                    value="${f.batchSize || state.defaultBatchSize}" min="1" max="50" 
-                    onchange="updateBatchFileSize('${f.fileId}', this.value)" style="width:80px;">
+                <input type="number"
+                       class="form-input"
+                       value="${f.batchSize || state.defaultBatchSize}"
+                       min="1"
+                       max="100"
+                       onchange="updateBatchFileSize('${f.fileId}', this.value)"
+                       style="width:90px;">
                 <span style="font-size:12px;color:var(--text-muted);">章/批次</span>
             </div>
+
+            <div class="batch-file-config">
+                <label>起始章节:</label>
+                <input type="number"
+                       class="form-input"
+                       value="${start}"
+                       min="1"
+                       max="${Math.max(1, total)}"
+                       onchange="updateBatchFileStartChapter('${f.fileId}', this.value)"
+                       style="width:100px;">
+                <span style="font-size:12px;color:var(--text-muted);">从第几章开始</span>
+            </div>
+
+            <div class="batch-file-config">
+                <label>结束章节:</label>
+                <input type="number"
+                       class="form-input"
+                       value="${end}"
+                       min="1"
+                       max="${Math.max(1, total)}"
+                       onchange="updateBatchFileEndChapter('${f.fileId}', this.value)"
+                       style="width:100px;">
+                <span style="font-size:12px;color:var(--text-muted);">处理到第几章</span>
+            </div>
+
+            <div style="margin-top:8px;font-size:12px;color:var(--text-muted);">
+                当前配置：${escapeHtml(getConfigNameById(f.configId))}
+            </div>
         </div>
-    `).join('') + `<p style="font-size:13px;color:var(--text-muted);margin-top:8px;">共 ${state.batchFiles.length} 个文件，${totalChapters} 个章节</p>`;
+        `;
+    }).join('') + `
+        <p style="font-size:13px;color:var(--text-muted);margin-top:8px;">
+            共 ${state.batchFiles.length} 个文件，${totalChapters} 个解析章节
+        </p>
+    `;
 }
 
 function removeBatchFile(fileId) {
@@ -688,57 +850,108 @@ function removeBatchFile(fileId) {
 }
 
 function updateBatchFileConfig(fileId, configId) {
-    const f = state.batchFiles.find(f => f.fileId === fileId);
-    if (f) f.configId = configId;
+    const f = state.batchFiles.find(x => x.fileId === fileId);
+    if (f) {
+        f.configId = configId;
+        renderBatchFiles();
+    }
 }
 
 function updateBatchFileSize(fileId, batchSize) {
-    const f = state.batchFiles.find(f => f.fileId === fileId);
-    if (f) f.batchSize = parseInt(batchSize) || state.defaultBatchSize;
+    const f = state.batchFiles.find(x => x.fileId === fileId);
+    if (f) {
+        f.batchSize = clampInt(batchSize, state.defaultBatchSize, 1, 100);
+        renderBatchFiles();
+    }
+}
+
+function updateBatchFileStartChapter(fileId, startChapter) {
+    const f = state.batchFiles.find(x => x.fileId === fileId);
+    if (!f) return;
+
+    const total = f.chapters.length;
+    f.startChapter = clampInt(startChapter, 1, 1, total);
+    if (f.startChapter > f.endChapter) {
+        f.endChapter = f.startChapter;
+    }
+    renderBatchFiles();
+}
+
+function updateBatchFileEndChapter(fileId, endChapter) {
+    const f = state.batchFiles.find(x => x.fileId === fileId);
+    if (!f) return;
+
+    const total = f.chapters.length;
+    f.endChapter = clampInt(endChapter, total, 1, total);
+    if (f.endChapter < f.startChapter) {
+        f.startChapter = f.endChapter;
+    }
+    renderBatchFiles();
 }
 
 async function submitBatch() {
     if (state.batchFiles.length === 0) return;
 
     showLoading('正在提交批处理任务...');
-    
-    // 获取全局批次大小和延迟配置
-    const globalBatchSize = parseInt($('globalBatchSize')?.value || state.defaultBatchSize);
-    const delayMin = parseInt($('globalDelayMin')?.value || state.batchDelayMin);
-    const delayMax = parseInt($('globalDelayMax')?.value || state.batchDelayMax);
-    
+
+    const globalBatchSize = clampInt($('globalBatchSize')?.value || state.defaultBatchSize, state.defaultBatchSize, 1, 100);
+    const delayMin = clampInt($('globalDelayMin')?.value || state.batchDelayMin, state.batchDelayMin, 0, 3600);
+    const delayMax = clampInt($('globalDelayMax')?.value || state.batchDelayMax, state.batchDelayMax, delayMin, 3600);
+
     const files = state.batchFiles.map(f => ({
         fileName: f.fileName,
         chapters: f.chapters,
         configId: f.configId,
-        batchSize: f.batchSize || globalBatchSize,
-        delayMin: delayMin,
-        delayMax: delayMax
+        configName: getConfigNameById(f.configId),
+        batchSize: clampInt(f.batchSize || globalBatchSize, globalBatchSize, 1, 100),
+        startChapter: clampInt(f.startChapter || 1, 1, 1, Math.max(1, f.chapters.length)),
+        endChapter: clampInt(f.endChapter || f.chapters.length, f.chapters.length, 1, Math.max(1, f.chapters.length))
     }));
 
     const data = await api('/api/batch', {
         method: 'POST',
-        body: JSON.stringify({ 
-            userId: 'default', 
+        body: JSON.stringify({
+            userId: 'default',
             files,
             batchSize: globalBatchSize,
-            delayMin: delayMin,
-            delayMax: delayMax
+            delayMin,
+            delayMax
         }),
     });
+
     hideLoading();
 
     if (data.success) {
-        showToast(`任务已提交: ${data.totalChapters} 个章节`, 'success');
+        let msg = `任务已提交：${data.totalChapters} 个章节`;
+        if (data.queuedFiles !== undefined) {
+            msg += `，入队 ${data.queuedFiles} 本`;
+        }
+        if (data.duplicateFiles && data.duplicateFiles.length > 0) {
+            msg += `，重复跳过 ${data.duplicateFiles.length} 本`;
+        }
+
+        showToast(msg, 'success');
+
+        if (data.duplicateFiles && data.duplicateFiles.length > 0) {
+            const duplicateNames = data.duplicateFiles.map(x => x.fileName).join('、');
+            showToast(`以下文件已在队列或处理中，已跳过：${duplicateNames}`, 'warning');
+        }
+
         state.batchFiles = [];
         renderBatchFiles();
         switchPage('tasks');
+        refreshTasks();
     } else {
-        showToast('提交失败: ' + (data.error || ''), 'error');
+        if (data.duplicates && data.duplicates.length > 0) {
+            const names = data.duplicates.map(x => x.fileName).join('、');
+            showToast(`重复提交，未进入队列：${names}`, 'warning');
+        } else {
+            showToast('提交失败: ' + (data.error || ''), 'error');
+        }
     }
 }
 
-// ==================== 任务管理 ====================
+// ==================== 任务 ====================
 async function refreshTasks() {
     const data = await api('/api/tasks');
     if (data.success) {
@@ -749,346 +962,291 @@ async function refreshTasks() {
 
 function renderTaskList() {
     const container = $('taskList');
-    const tasks = Object.values(state.tasks);
+    if (!container) return;
+
+    const tasks = Object.values(state.tasks || {}).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
     if (tasks.length === 0) {
-        container.innerHTML = '<div class="empty-state"><div class="icon">📋</div><p>暂无任务</p></div>';
+        container.innerHTML = `<div style="font-size:13px;color:var(--text-muted);">暂无任务</div>`;
         return;
     }
-    tasks.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
 
-    container.innerHTML = tasks.map(task => {
-        const progress = task.total_chapters > 0 ? (task.completed_chapters / task.total_chapters * 100) : 0;
-        const isRunning = task.status === 'processing' || task.status === 'pending';
-        // 已取消、失败、或已完成但有失败章节的任务可以恢复
-        const canResume = task.status === 'cancelled' || task.status === 'failed' || 
-            (task.status === 'completed' && task.failed_chapters > 0);
-        const filesBrief = (task.files || []).map(f => `${f.file_name}(${f.config_name})`).join(', ');
-        return `<div class="task-item">
-            <div class="task-info">
-                <div class="task-name">${escapeHtml(filesBrief || '批处理任务')}</div>
-                <div class="task-meta">${escapeHtml(task.message || '')} ${task.result_persisted ? '· ☁️已保存' : ''}</div>
-                <div class="task-files-brief">${task.completed_chapters || 0}/${task.total_chapters || 0} 章 (失败: ${task.failed_chapters || 0})</div>
-                <div class="progress-bar"><div class="progress-fill" style="width:${progress}%"></div></div>
+    container.innerHTML = tasks.map(task => `
+        <div class="task-item">
+            <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span style="font-weight:600;">任务 ${escapeHtml((task.task_id || '').slice(0, 8))}</span>
+                    <span style="font-size:12px;padding:2px 8px;border-radius:999px;background:var(--bg-primary);">${statusText(task.status)}</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-top:4px;">
+                    ${escapeHtml(task.progress || '')} · ${escapeHtml(task.message || '')}
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    文件：${task.files?.length || 0}
+                    · 排队：${task.queued_files || 0}
+                    · 处理中：${task.processing_files || 0}
+                    · 已完成：${task.completed_files || 0}
+                </div>
             </div>
-            <div class="task-actions">
-                <span class="task-status ${task.status}">${statusText(task.status)}</span>
-                <button class="btn btn-sm btn-secondary" onclick="viewTask('${task.task_id}')">👁 查看</button>
-                <button class="btn btn-sm btn-secondary" onclick="downloadTask('${task.task_id}')">📥 下载</button>
-                ${isRunning ? `<button class="btn btn-sm btn-danger" onclick="cancelTask('${task.task_id}')">取消</button>` : ''}
-                ${canResume ? `<button class="btn btn-sm btn-success" onclick="resumeTask('${task.task_id}')">▶ 恢复</button>` : ''}
-                <button class="btn btn-sm btn-danger" onclick="deleteTask('${task.task_id}')">🗑️</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-sm btn-secondary" onclick="viewTask('${task.task_id}')">查看</button>
+                <button class="btn btn-sm btn-secondary" onclick="downloadTask('${task.task_id}')">导出</button>
+                ${task.status === 'pending' || task.status === 'processing'
+                    ? `<button class="btn btn-sm btn-danger" onclick="cancelTask('${task.task_id}')">取消</button>`
+                    : ''
+                }
+                <button class="btn btn-sm btn-danger" onclick="deleteTask('${task.task_id}')">删除</button>
             </div>
-        </div>`;
-    }).join('');
+        </div>
+    `).join('');
 }
 
 async function viewTask(taskId) {
-    showLoading('加载任务详情...');
     const data = await api(`/api/task/${taskId}`);
-    hideLoading();
-
     if (!data.success) {
-        showToast(data.error || '加载失败', 'error');
+        showToast('获取任务详情失败', 'error');
         return;
     }
 
     state.viewingTaskId = taskId;
     const task = data.task;
-    $('taskViewTitle').textContent = `任务结果 - ${statusText(task.status)}`;
+    const modal = $('taskDetailModal');
+    const body = $('taskDetailBody');
+    if (!modal || !body) return;
 
-    let html = '';
-    (task.files || []).forEach((file, fi) => {
-        // 每本小说一个独立区块
-        const totalBatches = (file.results || []).length;
-        const completedChapters = file.completed || 0;
-        const totalChapters = file.total || 0;
-
-        html += `<div class="result-file-section">
-            <div class="result-file-title">📖 ${escapeHtml(file.file_name)} · ${completedChapters}/${totalChapters} 章 · ${totalBatches} 批次
-            <button class="btn btn-sm btn-secondary" style="float:right;margin-top:-4px;" onclick="downloadSingleNovel('${taskId}', ${fi})">📥 下载此小说</button>
-            </div>`;
-
-        // 按批次分组展示
-        (file.results || []).forEach((r, ri) => {
-            const batchNum = r.batch || ri + 1;
-            const totalB = r.total_batches || totalBatches;
-            const chStart = r.chapter_start || '?';
-            const chEnd = r.chapter_end || '?';
-            const chCount = r.chapter_count || '?';
-            const isSuccess = r.success;
-
-            // 章节标题列表
-            const titles = (r.chapter_titles || []).map(t => escapeHtml(t)).join('、');
-
-            html += `<div class="result-batch">
-                <div class="result-batch-header" onclick="toggleBatchResult(this)">
-                    <span class="result-batch-title">📦 批次 ${batchNum}/${totalB}: 第${chStart}-${chEnd}章 (共${chCount}章)</span>
-                    <span class="result-batch-status ${isSuccess ? 'success' : 'fail'}">${isSuccess ? '✓ 成功' : '✗ 失败'}</span>
+    body.innerHTML = `
+        <div style="margin-bottom:12px;">
+            <div><strong>任务ID：</strong>${escapeHtml(task.task_id || '')}</div>
+            <div><strong>状态：</strong>${escapeHtml(statusText(task.status || ''))}</div>
+            <div><strong>进度：</strong>${escapeHtml(task.progress || '')}</div>
+            <div><strong>说明：</strong>${escapeHtml(task.message || '')}</div>
+        </div>
+        ${(task.files || []).map((f, idx) => `
+            <div class="card" style="margin-bottom:12px;">
+                <div class="card-title">
+                    <span>${escapeHtml(f.file_name || '未命名')}</span>
+                    <span style="font-size:12px;color:var(--text-muted);">${escapeHtml(statusText(f.status || 'queued'))}</span>
                 </div>
-                <div class="result-batch-titles">${titles}</div>
-                <div class="result-batch-preview">${isSuccess ? escapeHtml(r.preview || '') : escapeHtml(r.error || '未知错误')}</div>
-                <div class="result-batch-full" id="batch-${fi}-${ri}">${isSuccess ? escapeHtml(r.result || '') : escapeHtml(r.error || '')}</div>
-            </div>`;
-        });
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px;">
+                    配置：${escapeHtml(f.config_name || '默认配置')}
+                    · 批次：${escapeHtml(String(f.batch_size || ''))}
+                    · 范围：${escapeHtml(String(f.start_chapter || 1))} ~ ${escapeHtml(String(f.end_chapter || f.total || 0))}
+                    · 完成：${escapeHtml(String(f.completed || 0))}/${escapeHtml(String(f.total || 0))}
+                    · 失败：${escapeHtml(String(f.failed || 0))}
+                </div>
+                <div style="display:flex;gap:8px;margin-bottom:8px;">
+                    <button class="btn btn-sm btn-secondary" onclick="downloadSingleNovel('${task.task_id}', ${idx})">导出本书</button>
+                </div>
+                <div style="max-height:240px;overflow:auto;background:var(--bg-primary);border-radius:8px;padding:10px;">
+                    ${(f.results || []).map(r => `
+                        <div style="padding:8px 0;border-bottom:1px solid var(--border);">
+                            <div style="font-size:13px;font-weight:600;">
+                                批次 ${escapeHtml(String(r.batch || '?'))}
+                                · 第${escapeHtml(String(r.chapter_start || '?'))}-${escapeHtml(String(r.chapter_end || '?'))}章
+                                · ${r.success ? '成功' : '失败'}
+                            </div>
+                            <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                                ${escapeHtml(r.preview || r.error || '')}
+                            </div>
+                        </div>
+                    `).join('') || '<div style="font-size:12px;color:var(--text-muted);">暂无结果</div>'}
+                </div>
+            </div>
+        `).join('')}
+    `;
 
-        if (!file.results || file.results.length === 0) {
-            html += '<p style="color:var(--text-muted);font-size:13px;">暂无结果</p>';
-        }
-        html += '</div>';
-    });
-
-    $('taskViewBody').innerHTML = html;
-    $('taskViewModal').classList.remove('hidden');
+    modal.classList.remove('hidden');
 }
 
-function toggleBatchResult(header) {
-    const batch = header.closest('.result-batch');
-    const full = batch.querySelector('.result-batch-full');
-    const preview = batch.querySelector('.result-batch-preview');
-    const titles = batch.querySelector('.result-batch-titles');
-    if (full.classList.contains('expanded')) {
-        full.classList.remove('expanded');
-        preview.style.display = '';
-        titles.style.display = '';
-    } else {
-        full.classList.add('expanded');
-        preview.style.display = 'none';
-        titles.style.display = 'none';
-    }
-}
-
-async function downloadTask(taskId) {
-    showLoading('准备下载...');
-    const data = await api(`/api/task/${taskId}/download`);
-    hideLoading();
-    if (data.success) {
-        const blob = new Blob([data.content], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = data.filename || 'batch_result.txt';
-        a.click();
-        URL.revokeObjectURL(url);
-        showToast('下载成功', 'success');
-    } else {
-        showToast(data.error || '下载失败', 'error');
-    }
-}
-
-async function downloadSingleNovel(taskId, fileIdx) {
-    showLoading('准备下载单本小说...');
-    const data = await api(`/api/task/${taskId}/download/${fileIdx}`);
-    hideLoading();
-    if (data.success) {
-        const blob = new Blob([data.content], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = data.filename || 'novel_result.txt';
-        a.click();
-        URL.revokeObjectURL(url);
-        showToast('下载成功', 'success');
-    } else {
-        showToast(data.error || '下载失败', 'error');
-    }
+function closeTaskDetail() {
+    const modal = $('taskDetailModal');
+    if (modal) modal.classList.add('hidden');
 }
 
 async function cancelTask(taskId) {
-    await api('/api/batch/cancel', { method: 'POST', body: JSON.stringify({ taskId }) });
-    showToast('任务已取消', 'success');
-    refreshTasks();
-}
-
-async function resumeTask(taskId) {
-    // 获取延迟配置
-    const delayMin = parseInt($('globalDelayMin')?.value || state.batchDelayMin);
-    const delayMax = parseInt($('globalDelayMax')?.value || state.batchDelayMax);
-    
-    showLoading('正在恢复任务...');
-    const data = await api('/api/batch/resume', { 
-        method: 'POST', 
-        body: JSON.stringify({ 
-            taskId,
-            delayMin: delayMin,
-            delayMax: delayMax
-        }) 
+    const data = await api('/api/batch/cancel', {
+        method: 'POST',
+        body: JSON.stringify({ taskId })
     });
-    hideLoading();
-    
+
     if (data.success) {
-        showToast('任务已恢复运行', 'success');
+        showToast('任务已取消', 'success');
         refreshTasks();
     } else {
-        showToast('恢复失败: ' + (data.error || ''), 'error');
+        showToast('取消失败: ' + (data.error || ''), 'error');
     }
 }
 
 async function deleteTask(taskId) {
-    if (!confirm('确定删除此任务？')) return;
-    await api('/api/task/delete', { method: 'POST', body: JSON.stringify({ taskId }) });
-    showToast('已删除', 'success');
-    refreshTasks();
+    const data = await api('/api/task/delete', {
+        method: 'POST',
+        body: JSON.stringify({ taskId })
+    });
+
+    if (data.success) {
+        showToast('任务已删除', 'success');
+        refreshTasks();
+    } else {
+        showToast('删除失败: ' + (data.error || ''), 'error');
+    }
+}
+
+async function downloadTask(taskId) {
+    const data = await api(`/api/task/${taskId}/download`);
+    if (data.success) {
+        downloadTextFile(data.filename || 'task.txt', data.content || '');
+    } else {
+        showToast('导出失败', 'error');
+    }
+}
+
+async function downloadSingleNovel(taskId, fileIdx) {
+    const data = await api(`/api/task/${taskId}/download/${fileIdx}`);
+    if (data.success) {
+        downloadTextFile(data.filename || 'novel.txt', data.content || '');
+    } else {
+        showToast('导出失败', 'error');
+    }
+}
+
+function downloadTextFile(filename, content) {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
 }
 
 // ==================== 云端文件 ====================
-function getCloudHfConfig() {
-    return {
-        hfToken: ($('cloudHfToken') ? $('cloudHfToken').value : '') || '',
-        hfDataset: ($('cloudHfDataset') ? $('cloudHfDataset').value : '') || ''
-    };
-}
-
 async function refreshCloudFiles() {
-    showLoading('加载文件列表...');
-    const { hfToken, hfDataset } = getCloudHfConfig();
-    const data = await api(`/api/hf-files?hfToken=${encodeURIComponent(hfToken)}&hfDataset=${encodeURIComponent(hfDataset)}`);
-    hideLoading();
+    const hfDataset = state.serverDefaults.hfDataset || '';
+    const data = await api(`/api/hf-files?hfToken=&hfDataset=${encodeURIComponent(hfDataset)}`);
     if (data.success) {
         state.cloudFiles = data.files || [];
         renderCloudFiles();
-    } else {
-        $('cloudFileList').innerHTML = `<div class="empty-state"><div class="icon">⚠️</div><p>${escapeHtml(data.error || '加载失败，请检查 HF 配置')}</p></div>`;
     }
 }
 
 function renderCloudFiles() {
-    const c = $('cloudFileList');
-    if (state.cloudFiles.length === 0) {
-        c.innerHTML = '<div class="empty-state"><div class="icon">☁️</div><p>暂无文件</p></div>';
+    const container = $('cloudFileList');
+    if (!container) return;
+
+    if (!state.cloudFiles.length) {
+        container.innerHTML = `<div style="font-size:13px;color:var(--text-muted);">暂无云端文件</div>`;
         return;
     }
-    c.innerHTML = state.cloudFiles.map(f =>
-        `<div class="file-item">
-            <span>📄 ${escapeHtml(f.name || f.path)}</span>
-            <div style="display:flex;gap:6px;">
-                <button class="btn btn-sm btn-secondary" onclick="downloadCloudFile('${escapeHtml(f.path)}')">下载</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteCloudFile('${escapeHtml(f.path)}')">删除</button>
+
+    container.innerHTML = state.cloudFiles.map(f => `
+        <div class="task-item">
+            <div>${escapeHtml(f.name || f.path || '')}</div>
+            <div style="display:flex;gap:8px;">
+                <button class="btn btn-sm btn-secondary" onclick="downloadCloudFile('${encodeURIComponent(f.path || '')}')">下载</button>
             </div>
-        </div>`
-    ).join('');
+        </div>
+    `).join('');
 }
 
-async function downloadCloudFile(path) {
-    showLoading('下载中...');
-    const { hfToken, hfDataset } = getCloudHfConfig();
+async function downloadCloudFile(encodedPath) {
+    const filename = decodeURIComponent(encodedPath);
     const data = await api('/api/hf-download', {
         method: 'POST',
-        body: JSON.stringify({ hfToken, hfDataset, filename: path }),
+        body: JSON.stringify({
+            hfToken: '',
+            hfDataset: state.serverDefaults.hfDataset || '',
+            filename
+        })
     });
-    hideLoading();
+
     if (data.success) {
-        const blob = new Blob([data.content], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = data.filename || 'download.txt';
-        a.click();
-        URL.revokeObjectURL(url);
+        downloadTextFile(data.filename || 'cloud.txt', data.content || '');
     } else {
-        showToast(data.error || '下载失败', 'error');
+        showToast('云端下载失败: ' + (data.error || ''), 'error');
     }
 }
 
-async function deleteCloudFile(path) {
-    if (!confirm(`确定删除 ${path}？`)) return;
-    const { hfToken, hfDataset } = getCloudHfConfig();
-    const data = await api('/api/hf-action', {
-        method: 'POST',
-        body: JSON.stringify({ hfToken, hfDataset, action: 'delete', filename: path }),
-    });
-    if (data.success) {
-        showToast('已删除', 'success');
-        refreshCloudFiles();
-    } else {
-        showToast(data.error || '删除失败', 'error');
-    }
-}
-
-// ==================== 任务轮询 ====================
-function startTaskPolling() {
-    if (state.taskPollTimer) clearInterval(state.taskPollTimer);
-    state.taskPollTimer = setInterval(() => {
-        if (state.currentPage === 'tasks') refreshTasks();
-    }, 3000);
-}
-
-// ==================== 事件绑定 ====================
+// ==================== 初始化 ====================
 function bindEvents() {
     document.querySelectorAll('.nav-item').forEach(item => {
         item.addEventListener('click', () => switchPage(item.dataset.page));
     });
 
-    // 聊天
-    $('btnSendMessage').addEventListener('click', sendMessage);
-    $('chatInput').addEventListener('keydown', e => {
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendMessage();
-    });
-    $('chatInput').addEventListener('input', e => {
-        e.target.style.height = 'auto';
-        e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
-    });
-    $('btnNewConv').addEventListener('click', createConversation);
-
-    // 批处理
-    $('batchUploadArea').addEventListener('click', () => $('batchFileInput').click());
-    $('batchFileInput').addEventListener('change', e => {
-        if (e.target.files.length) handleBatchFiles(e.target.files);
-        e.target.value = '';
-    });
-    $('batchUploadArea').addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); });
-    $('batchUploadArea').addEventListener('drop', e => {
-        e.preventDefault(); e.stopPropagation();
-        if (e.dataTransfer.files.length) handleBatchFiles(e.dataTransfer.files);
-    });
-    $('btnSubmitBatch').addEventListener('click', submitBatch);
-    $('btnClearBatch').addEventListener('click', () => { state.batchFiles = []; renderBatchFiles(); });
-
-    // 任务
-    $('btnRefreshTasks').addEventListener('click', refreshTasks);
-
-    // 云端文件
-    $('btnRefreshCloudFiles').addEventListener('click', refreshCloudFiles);
-
-    // 设置 - 默认配置
-    $('btnSaveDefaults').addEventListener('click', saveDefaults);
-    
-    // 设置 - 线程池
-    $('btnSaveThreadSettings').addEventListener('click', saveThreadSettings);
-    
-    // 设置 - 延迟
-    $('btnSaveDelaySettings').addEventListener('click', saveDelaySettings);
-
-    // 配置管理
-    $('btnNewConfig').addEventListener('click', () => openConfigModal());
-    $('btnCloseConfigModal').addEventListener('click', () => $('configModal').classList.add('hidden'));
-    $('btnCancelConfig').addEventListener('click', () => $('configModal').classList.add('hidden'));
-    $('btnSaveConfig').addEventListener('click', saveConfig);
-    $('btnDeleteConfig').addEventListener('click', deleteConfig);
-
-    // 任务查看模态框
-    $('btnCloseTaskView').addEventListener('click', () => $('taskViewModal').classList.add('hidden'));
-    $('btnCloseTaskView2').addEventListener('click', () => $('taskViewModal').classList.add('hidden'));
-    $('btnDownloadFromView').addEventListener('click', () => {
-        if (state.viewingTaskId) downloadTask(state.viewingTaskId);
-    });
-
-    // 密钥可见性切换
-    document.querySelectorAll('.toggle-visibility').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const target = $(btn.dataset.target);
-            target.type = target.type === 'password' ? 'text' : 'password';
+    if ($('btnCreateConversation')) $('btnCreateConversation').addEventListener('click', createConversation);
+    if ($('btnSendChat')) $('btnSendChat').addEventListener('click', sendChat);
+    if ($('chatInput')) {
+        $('chatInput').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendChat();
+            }
         });
-    });
+    }
+
+    if ($('batchFileInput')) {
+        $('batchFileInput').addEventListener('change', (e) => {
+            handleBatchFiles(e.target.files || []);
+            e.target.value = '';
+        });
+    }
+
+    if ($('batchUploadArea')) {
+        $('batchUploadArea').addEventListener('click', () => $('batchFileInput')?.click());
+        $('batchUploadArea').addEventListener('dragover', (e) => {
+            e.preventDefault();
+        });
+        $('batchUploadArea').addEventListener('drop', (e) => {
+            e.preventDefault();
+            handleBatchFiles(e.dataTransfer.files || []);
+        });
+    }
+
+    if ($('btnSubmitBatch')) $('btnSubmitBatch').addEventListener('click', submitBatch);
+    if ($('btnSaveDefaults')) $('btnSaveDefaults').addEventListener('click', saveDefaults);
+    if ($('btnSaveThreadSettings')) $('btnSaveThreadSettings').addEventListener('click', saveThreadSettings);
+    if ($('btnSaveConfig')) $('btnSaveConfig').addEventListener('click', saveConfig);
+    if ($('btnClearConfigForm')) $('btnClearConfigForm').addEventListener('click', clearConfigForm);
+    if ($('btnCloseTaskDetail')) $('btnCloseTaskDetail').addEventListener('click', closeTaskDetail);
 }
 
-// ==================== 初始化 ====================
+function startTaskPolling() {
+    if (state.taskPollTimer) clearInterval(state.taskPollTimer);
+    state.taskPollTimer = setInterval(() => {
+        refreshTasks();
+    }, 3000);
+}
+
 async function init() {
     bindEvents();
     await loadServerSettings();
+    renderServerConfigStatus();
+    renderDefaultsForm();
     await refreshConfigs();
     await loadConversations();
-    renderChatMessages();
+    await loadThreadSettings();
+    await refreshTasks();
     startTaskPolling();
+    switchPage('chat');
 }
+
+window.switchPage = switchPage;
+window.removeBatchFile = removeBatchFile;
+window.updateBatchFileConfig = updateBatchFileConfig;
+window.updateBatchFileSize = updateBatchFileSize;
+window.updateBatchFileStartChapter = updateBatchFileStartChapter;
+window.updateBatchFileEndChapter = updateBatchFileEndChapter;
+window.submitBatch = submitBatch;
+window.editConfig = editConfig;
+window.deleteConfig = deleteConfig;
+window.selectConversation = selectConversation;
+window.deleteConversation = deleteConversation;
+window.viewTask = viewTask;
+window.closeTaskDetail = closeTaskDetail;
+window.cancelTask = cancelTask;
+window.deleteTask = deleteTask;
+window.downloadTask = downloadTask;
+window.downloadSingleNovel = downloadSingleNovel;
+window.downloadCloudFile = downloadCloudFile;
 
 document.addEventListener('DOMContentLoaded', init);
