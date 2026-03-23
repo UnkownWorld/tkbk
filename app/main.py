@@ -19,7 +19,7 @@ from app.services.app_settings_service import app_settings_service
 
 logger = logging.getLogger(__name__)
 
-# 全局配置
+# 全局配置（会在 register_routes(app) 时用 app.config 覆盖）
 DEFAULT_THREAD_POOL_SIZE = 10
 DEFAULT_BATCH_SIZE = 10
 MAX_CONCURRENT_TASKS = 10
@@ -33,7 +33,7 @@ _http_session = http_requests.Session()
 _book_queue = queue.Queue()
 _worker_threads = []
 _worker_lock = threading.RLock()
-_worker_stop_event = threading.Event()
+_worker_generation = 0
 
 _book_dedup_index = {}
 _book_dedup_lock = threading.RLock()
@@ -89,10 +89,12 @@ def _sanitize_filename(name: str) -> str:
 def _get_worker_stats():
     with _worker_lock:
         alive = sum(1 for t in _worker_threads if t.is_alive())
+        generation = _worker_generation
     return {
         "workerCount": len(_worker_threads),
         "aliveWorkers": alive,
         "queueSize": _book_queue.qsize(),
+        "generation": generation,
     }
 
 
@@ -113,35 +115,52 @@ def _sleep_with_cancel_check(task_id: str, seconds: int) -> bool:
 
 # ==================== Worker 生命周期 ====================
 
-def _ensure_workers():
+def _start_workers(count: int):
     global _worker_threads
     with _worker_lock:
-        desired = max(1, DEFAULT_THREAD_POOL_SIZE)
-        alive_threads = [t for t in _worker_threads if t.is_alive()]
-        _worker_threads = alive_threads
-
-        missing = desired - len(_worker_threads)
-        for i in range(missing):
+        for i in range(count):
             worker = threading.Thread(
                 target=_book_worker_loop,
-                name=f"book-worker-{len(_worker_threads) + i + 1}",
+                args=(_worker_generation,),
+                name=f"book-worker-g{_worker_generation}-{i+1}",
                 daemon=True
             )
             worker.start()
             _worker_threads.append(worker)
 
-        logger.info(f"Worker池已就绪: desired={desired}, alive={len(_worker_threads)}")
+        logger.info(f"Worker池启动完成: generation={_worker_generation}, count={count}")
 
 
-def _restart_workers(new_size: int):
-    global DEFAULT_THREAD_POOL_SIZE
-    DEFAULT_THREAD_POOL_SIZE = max(1, new_size)
-    _ensure_workers()
+def _rebuild_workers(new_size: int):
+    global DEFAULT_THREAD_POOL_SIZE, _worker_generation, _worker_threads
+
+    new_size = max(1, _safe_int(new_size, DEFAULT_THREAD_POOL_SIZE, min_value=1, max_value=100))
+
+    with _worker_lock:
+        DEFAULT_THREAD_POOL_SIZE = new_size
+        _worker_generation += 1
+        _worker_threads = []
+
+        logger.info(f"重建Worker池: generation={_worker_generation}, new_size={new_size}")
+        _start_workers(new_size)
 
 
-def _book_worker_loop():
-    logger.info(f"[{threading.current_thread().name}] 启动")
-    while not _worker_stop_event.is_set():
+def _ensure_workers():
+    with _worker_lock:
+        if any(t.is_alive() for t in _worker_threads):
+            return
+    _rebuild_workers(DEFAULT_THREAD_POOL_SIZE)
+
+
+def _book_worker_loop(local_generation: int):
+    logger.info(f"[{threading.current_thread().name}] 启动 generation={local_generation}")
+    while True:
+        # 如果 generation 变化，说明 worker 池已重建，当前 worker 退出
+        with _worker_lock:
+            if local_generation != _worker_generation:
+                logger.info(f"[{threading.current_thread().name}] generation过期，退出")
+                return
+
         try:
             item = _book_queue.get(timeout=1)
         except queue.Empty:
@@ -169,9 +188,13 @@ def _book_worker_loop():
             _mark_file_processing(task_id, file_idx)
             _set_dedup_status(fingerprint, task_id, file_info.get("file_name", ""), "processing")
 
-            logger.info(f"[{threading.current_thread().name}] 开始处理 task={task_id} file_idx={file_idx} file={file_info.get('file_name')}")
-            _process_single_book(task_id, file_idx)
+            logger.info(
+                f"[{threading.current_thread().name}] 开始处理 "
+                f"task={task_id} file_idx={file_idx} file={file_info.get('file_name')} "
+                f"config_id={file_info.get('config_id')!r} config_name={file_info.get('config_name')!r}"
+            )
 
+            _process_single_book(task_id, file_idx)
             _update_task_status_if_finished(task_id)
 
         except Exception as e:
@@ -651,7 +674,6 @@ def _process_single_book(task_id: str, file_idx: int):
         _update_task_status_if_finished(task_id)
         return
 
-    # ==================== 这里是关键修复 ====================
     system_prompt = (
         config.get("batchSystemPrompt")
         or config.get("systemPrompt")
@@ -660,23 +682,28 @@ def _process_single_book(task_id: str, file_idx: int):
     user_prompt_template = config.get("batchUserPromptTemplate") or ""
 
     logger.info(
-        f"[{task_id}] [{file_name}] prompt检查: "
+        f"[{task_id}] [{file_name}] 配置检查: "
+        f"config_id={file_info.get('config_id')!r}, "
+        f"config_name={file_info.get('config_name')!r}, "
+        f"model={config.get('model')!r}, "
         f"batchSystemPrompt_len={len(config.get('batchSystemPrompt') or '')}, "
         f"systemPrompt_len={len(config.get('systemPrompt') or '')}, "
         f"batchUserPromptTemplate_len={len(config.get('batchUserPromptTemplate') or '')}"
     )
     logger.info(
-        f"[{task_id}] [{file_name}] 实际使用system_prompt前120字符: "
-        f"{repr(system_prompt[:120])}"
+        f"[{task_id}] [{file_name}] 实际使用system_prompt前120字符: {repr(system_prompt[:120])}"
     )
-    # ======================================================
 
     context_messages = []
 
     total_chapters = len(chapters)
     total_batches = (total_chapters + batch_size - 1) // batch_size
 
-    logger.info(f"[{task_id}] 开始处理单本小说 [{file_name}]，共 {total_chapters} 章，{total_batches} 批，每批 {batch_size} 章")
+    logger.info(
+        f"[{task_id}] 开始处理单本小说 [{file_name}]，"
+        f"共 {total_chapters} 章，{total_batches} 批，每批 {batch_size} 章，"
+        f"当前worker总数={DEFAULT_THREAD_POOL_SIZE}"
+    )
 
     try:
         for batch_index in range(total_batches):
@@ -848,6 +875,28 @@ def _upload_single_novel_result(task_id: str, file_idx: int):
 # ==================== 路由注册 ====================
 
 def register_routes(app):
+    global DEFAULT_THREAD_POOL_SIZE, MAX_CONCURRENT_TASKS
+
+    # 关键修复：启动时同步 app.config，而不是永远写死10
+    DEFAULT_THREAD_POOL_SIZE = _safe_int(
+        app.config.get("MAX_THREAD_WORKERS", DEFAULT_THREAD_POOL_SIZE),
+        DEFAULT_THREAD_POOL_SIZE,
+        min_value=1,
+        max_value=100
+    )
+    MAX_CONCURRENT_TASKS = _safe_int(
+        app.config.get("MAX_CONCURRENT_TASKS", MAX_CONCURRENT_TASKS),
+        MAX_CONCURRENT_TASKS,
+        min_value=1,
+        max_value=100
+    )
+
+    logger.info(
+        f"register_routes 初始化: "
+        f"DEFAULT_THREAD_POOL_SIZE={DEFAULT_THREAD_POOL_SIZE}, "
+        f"MAX_CONCURRENT_TASKS={MAX_CONCURRENT_TASKS}"
+    )
+
     _ensure_workers()
 
     @app.route('/')
@@ -868,6 +917,7 @@ def register_routes(app):
             'workerCount': worker_stats['workerCount'],
             'aliveWorkers': worker_stats['aliveWorkers'],
             'queueSize': worker_stats['queueSize'],
+            'generation': worker_stats['generation'],
         })
 
     @app.route('/api/settings', methods=['GET'])
@@ -900,8 +950,11 @@ def register_routes(app):
     def set_thread_pool():
         data = request.json or {}
         value = _safe_int(data.get('threadPoolSize', 10), 10, min_value=1, max_value=100)
-        _restart_workers(value)
-        logger.info(f"工作线程数调整为: {value}")
+
+        # 关键修复：真正重建 worker 池，支持从10缩到3
+        _rebuild_workers(value)
+
+        logger.info(f"工作线程数调整为: {value}（已重建worker池）")
         return jsonify({'success': True, 'threadPoolSize': value})
 
     @app.route('/api/set-batch-delay', methods=['POST'])
@@ -932,6 +985,7 @@ def register_routes(app):
             'taskCount': task_store.task_count(),
             'queueSize': worker_stats['queueSize'],
             'aliveWorkers': worker_stats['aliveWorkers'],
+            'generation': worker_stats['generation'],
         })
 
     @app.route('/api/config/list', methods=['GET'])
@@ -961,6 +1015,11 @@ def register_routes(app):
             "hfToken": data.get('hfToken', ''),
             "hfDataset": data.get('hfDataset', ''),
         }
+        logger.info(
+            f"保存配置: id={config_id}, name={config_data.get('name')!r}, "
+            f"batchSystemPrompt_len={len(config_data.get('batchSystemPrompt') or '')}, "
+            f"systemPrompt_len={len(config_data.get('systemPrompt') or '')}"
+        )
         conversation_config_store.save_config(user_id, config_id, config_data)
         return jsonify({'success': True, 'id': config_id})
 
@@ -1079,7 +1138,21 @@ def register_routes(app):
             end_chapter = f.get('endChapter')
             end_chapter = _safe_int(end_chapter, len(chapters), min_value=1, max_value=max(1, len(chapters)))
 
+            logger.info(
+                f"[submit_batch] 文件={f.get('fileName')} 收到 "
+                f"configId={config_id!r}, configName={config_name!r}, "
+                f"batchSize={file_batch_size}, start={start_chapter}, end={end_chapter}"
+            )
+
             resolved_config = app_settings_service.resolve_config_from_id(user_id, config_id)
+
+            logger.info(
+                f"[submit_batch] 文件={f.get('fileName')} resolved_config: "
+                f"model={resolved_config.get('model')!r}, "
+                f"batchSystemPrompt_len={len(resolved_config.get('batchSystemPrompt') or '')}, "
+                f"systemPrompt_len={len(resolved_config.get('systemPrompt') or '')}"
+            )
+
             if resolved_config.get('batchSize'):
                 file_batch_size = _safe_int(resolved_config['batchSize'], file_batch_size, min_value=1)
 
