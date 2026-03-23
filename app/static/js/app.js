@@ -734,12 +734,14 @@ async function handleBatchFiles(files) {
                 const chapters = parseChaptersLocal(content);
                 resolve({
                     fileName: file.name,
+                    content,               // 关键：保留原始全文
                     chapters,
                     success: chapters.length > 0
                 });
             };
             reader.onerror = () => resolve({
                 fileName: file.name,
+                content: '',
                 chapters: [],
                 success: false
             });
@@ -760,6 +762,7 @@ async function handleBatchFiles(files) {
             fileId,
             localFingerprint,
             fileName: result.fileName,
+            content: result.content || '',   // 关键：存进 state.batchFiles
             chapters: result.chapters,
             configId: '',
             batchSize: state.defaultBatchSize,
@@ -892,7 +895,7 @@ function updateBatchFileEndChapter(fileId, endChapter) {
 }
 
 
- async function submitBatch() {
+async function submitBatch() {
     if (state.batchFiles.length === 0) return;
 
     showLoading('正在提交批处理任务...');
@@ -923,8 +926,8 @@ function updateBatchFileEndChapter(fileId, endChapter) {
 
             return {
                 fileName: f.fileName || f.name || '未命名',
-                content: f.content || '',          // 关键：把原始全文带给后端
-                rawContent: f.content || '',       // 双保险兼容后端
+                content: f.content || '',       // 关键：把原始全文传给后端
+                rawContent: f.content || '',    // 双保险兼容后端
                 chapters: chapters,
                 configId: f.configId || '',
                 configName: getConfigNameById(f.configId || ''),
@@ -980,7 +983,7 @@ function updateBatchFileEndChapter(fileId, endChapter) {
         console.error('submitBatch error:', e);
         showToast(`提交失败：${e.message || e}`, 'error');
     }
-}   
+}
 
 // ==================== 任务 ====================
 async function refreshTasks() {
