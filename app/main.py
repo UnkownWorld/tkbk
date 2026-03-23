@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import uuid
@@ -6,8 +5,9 @@ import threading
 import logging
 import re
 import random
+import hashlib
+import queue
 import requests as http_requests
-from concurrent.futures import ThreadPoolExecutor
 from flask import request, jsonify, send_from_directory
 
 from app.stores.task_store import task_store
@@ -20,16 +20,25 @@ from app.services.app_settings_service import app_settings_service
 logger = logging.getLogger(__name__)
 
 # 全局配置
-DEFAULT_THREAD_POOL_SIZE = 10
-DEFAULT_BATCH_SIZE = 10  # 默认每批次10章
-MAX_CONCURRENT_TASKS = 10
-# 批次间延迟配置（秒）- 默认值，可通过API调整
-BATCH_DELAY_MIN = 15  # 默认最小延迟15秒
-BATCH_DELAY_MAX = 45  # 默认最大延迟45秒
+DEFAULT_THREAD_POOL_SIZE = 10       # 工作线程数：同时最多处理多少本书
+DEFAULT_BATCH_SIZE = 10             # 默认每批次10章
+MAX_CONCURRENT_TASKS = 10           # 兼容保留，实际以工作线程池并发为主
+BATCH_DELAY_MIN = 15
+BATCH_DELAY_MAX = 45
 
-task_semaphore = threading.Semaphore(MAX_CONCURRENT_TASKS)
-executor = ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE)
 _http_session = http_requests.Session()
+
+# ==================== 全局队列 / Worker ====================
+
+_book_queue = queue.Queue()
+_worker_threads = []
+_worker_lock = threading.RLock()
+_worker_stop_event = threading.Event()
+
+# 去重索引：fingerprint -> metadata
+# metadata: {"task_id": ..., "file_name": ..., "status": queued/processing}
+_book_dedup_index = {}
+_book_dedup_lock = threading.RLock()
 
 
 # ==================== 通用工具 ====================
@@ -39,7 +48,6 @@ def _safe_int(value, default, min_value=None, max_value=None):
         result = int(value)
     except (TypeError, ValueError):
         result = default
-
     if min_value is not None:
         result = max(min_value, result)
     if max_value is not None:
@@ -52,7 +60,6 @@ def _safe_float(value, default, min_value=None, max_value=None):
         result = float(value)
     except (TypeError, ValueError):
         result = default
-
     if min_value is not None:
         result = max(min_value, result)
     if max_value is not None:
@@ -60,38 +67,195 @@ def _safe_float(value, default, min_value=None, max_value=None):
     return result
 
 
-def _get_available_slots():
-    return getattr(task_semaphore, "_value", 0)
-
-
 def _extract_assistant_content(result: dict) -> str:
     try:
-        return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return result.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     except Exception:
         return ""
+
+
+def _normalize_text_for_hash(text: str) -> str:
+    if text is None:
+        return ""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(_normalize_text_for_hash(text).encode("utf-8")).hexdigest()
+
+
+def _sanitize_filename(name: str) -> str:
+    return (name or "未命名").replace(" ", "_").replace("/", "_").replace("\\", "_").replace("\n", "").replace("\r", "")[:80]
+
+
+def _get_worker_stats():
+    with _worker_lock:
+        alive = sum(1 for t in _worker_threads if t.is_alive())
+    return {
+        "workerCount": len(_worker_threads),
+        "aliveWorkers": alive,
+        "queueSize": _book_queue.qsize(),
+    }
+
+
+def _random_delay_seconds(delay_min: int, delay_max: int) -> int:
+    delay_min = max(0, _safe_int(delay_min, BATCH_DELAY_MIN, min_value=0))
+    delay_max = max(delay_min, _safe_int(delay_max, BATCH_DELAY_MAX, min_value=0))
+    return random.randint(delay_min, delay_max) if delay_max > 0 else 0
+
+
+def _sleep_with_cancel_check(task_id: str, seconds: int) -> bool:
+    for _ in range(max(0, seconds)):
+        task = task_store.get_task_ref(task_id)
+        if not task or task.get("status") == "cancelled":
+            return False
+        time.sleep(1)
+    return True
+
+
+# ==================== Worker 生命周期 ====================
+
+def _ensure_workers():
+    global _worker_threads
+    with _worker_lock:
+        desired = max(1, DEFAULT_THREAD_POOL_SIZE)
+        alive_threads = [t for t in _worker_threads if t.is_alive()]
+        _worker_threads = alive_threads
+
+        missing = desired - len(_worker_threads)
+        for i in range(missing):
+            worker = threading.Thread(
+                target=_book_worker_loop,
+                name=f"book-worker-{len(_worker_threads) + i + 1}",
+                daemon=True
+            )
+            worker.start()
+            _worker_threads.append(worker)
+
+        logger.info(f"Worker池已就绪: desired={desired}, alive={len(_worker_threads)}")
+
+
+def _restart_workers(new_size: int):
+    global DEFAULT_THREAD_POOL_SIZE
+    DEFAULT_THREAD_POOL_SIZE = max(1, new_size)
+    _ensure_workers()
+
+
+def _book_worker_loop():
+    logger.info(f"[{threading.current_thread().name}] 启动")
+    while not _worker_stop_event.is_set():
+        try:
+            item = _book_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        try:
+            task_id = item["task_id"]
+            file_idx = item["file_idx"]
+
+            task = task_store.get_task(task_id)
+            if not task:
+                _book_queue.task_done()
+                continue
+
+            file_info = task["files"][file_idx]
+            fingerprint = file_info.get("fingerprint")
+
+            # 任务已取消，跳过
+            if task.get("status") == "cancelled":
+                _mark_file_terminal(task_id, file_idx, "cancelled", "任务已取消")
+                _release_dedup_if_terminal(fingerprint, "cancelled")
+                _update_task_status_if_finished(task_id)
+                _book_queue.task_done()
+                continue
+
+            # 标记处理中
+            _mark_file_processing(task_id, file_idx)
+            _set_dedup_status(fingerprint, task_id, file_info.get("file_name", ""), "processing")
+
+            logger.info(f"[{threading.current_thread().name}] 开始处理 task={task_id} file_idx={file_idx} file={file_info.get('file_name')}")
+            _process_single_book(task_id, file_idx)
+
+            # 单本结束后更新任务聚合状态
+            _update_task_status_if_finished(task_id)
+
+        except Exception as e:
+            logger.error(f"[{threading.current_thread().name}] 处理书籍任务异常: {e}", exc_info=True)
+        finally:
+            _book_queue.task_done()
+
+
+# ==================== 去重索引 ====================
+
+def _build_book_fingerprint(file_name: str, chapters: list, config_id: str, batch_size: int, start_chapter: int, end_chapter: int) -> str:
+    chapter_digest_parts = []
+    for ch in chapters:
+        title = ch.get("title", "")
+        content = ch.get("content", "")
+        chapter_digest_parts.append(f"{title}\n{_sha256_text(content)}")
+
+    payload = {
+        "file_name": file_name or "",
+        "chapters_digest": chapter_digest_parts,
+        "config_id": config_id or "__default__",
+        "batch_size": batch_size,
+        "start_chapter": start_chapter,
+        "end_chapter": end_chapter,
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _check_duplicate_fingerprint(fingerprint: str):
+    with _book_dedup_lock:
+        item = _book_dedup_index.get(fingerprint)
+        if item and item.get("status") in ("queued", "processing"):
+            return item
+        return None
+
+
+def _register_fingerprint(fingerprint: str, task_id: str, file_name: str, status: str = "queued"):
+    with _book_dedup_lock:
+        _book_dedup_index[fingerprint] = {
+            "task_id": task_id,
+            "file_name": file_name,
+            "status": status,
+            "updated_at": time.time(),
+        }
+
+
+def _set_dedup_status(fingerprint: str, task_id: str, file_name: str, status: str):
+    if not fingerprint:
+        return
+    with _book_dedup_lock:
+        _book_dedup_index[fingerprint] = {
+            "task_id": task_id,
+            "file_name": file_name,
+            "status": status,
+            "updated_at": time.time(),
+        }
+
+
+def _release_dedup_if_terminal(fingerprint: str, status: str):
+    if not fingerprint:
+        return
+    with _book_dedup_lock:
+        item = _book_dedup_index.get(fingerprint)
+        if not item:
+            return
+        item["status"] = status
+        item["updated_at"] = time.time()
 
 
 # ==================== LLM 调用 ====================
 
 def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
-    """
-    调用LLM API
-
-    Args:
-        config: 配置字典
-        messages: 消息列表
-        use_stream: 是否使用流式响应
-
-    Returns:
-        (success, result) - 成功时result是响应JSON，失败时result是错误信息
-    """
     api_host = (config.get("apiHost", "") or "").rstrip("/")
     api_key = config.get("apiKey", "")
     model = config.get("model", "gpt-5.4")
     temperature = _safe_float(config.get("temperature", 0.7), 0.7)
     top_p = _safe_float(config.get("topP", 0.65), 0.65)
-    # max_tokens设置为1M (1000000)，除非用户明确指定较小值
     max_tokens = _safe_int(config.get("maxOutputTokens", 1000000), 1000000, min_value=1)
+
     if max_tokens <= 0:
         max_tokens = 1000000
 
@@ -109,24 +273,21 @@ def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
-        "stream": use_stream,  # 启用流式响应
+        "stream": use_stream,
     }
 
-    # 批处理使用更长的超时时间（30分钟），聊天使用较短超时（10分钟）
     timeout = 1800 if use_stream else 600
 
     try:
         if use_stream:
-            # 流式响应处理
             resp = _http_session.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
             if resp.status_code != 200:
                 return False, f"API错误: {resp.status_code} - {resp.text[:200]}"
 
-            # 收集流式响应
             full_content = ""
             for line in resp.iter_lines():
                 if line:
-                    line = line.decode('utf-8', errors='ignore')
+                    line = line.decode("utf-8", errors="ignore")
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
@@ -140,13 +301,31 @@ def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
 
             return True, {"choices": [{"message": {"content": full_content}}]}
         else:
-            # 非流式响应（聊天功能使用）
             resp = _http_session.post(url, headers=headers, json=payload, timeout=timeout)
             if resp.status_code == 200:
                 return True, resp.json()
             return False, f"API错误: {resp.status_code} - {resp.text[:200]}"
     except Exception as e:
         return False, str(e)
+
+
+def _call_llm_batch_with_retry(config: dict, messages: list, task_id: str, delay_min: int, delay_max: int, max_retries: int = 3):
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        success, result = _call_llm_api(config, messages, use_stream=True)
+        if success:
+            return True, result
+
+        last_error = result
+        logger.warning(f"[{task_id}] LLM批次调用失败 (第 {attempt}/{max_retries} 次): {last_error}")
+
+        if attempt < max_retries:
+            delay = _random_delay_seconds(delay_min, delay_max)
+            logger.info(f"[{task_id}] 批次失败，{delay} 秒后重试")
+            if not _sleep_with_cancel_check(task_id, delay):
+                return False, "任务已取消"
+
+    return False, last_error
 
 
 def _build_messages(system_prompt: str, history: list, user_message: str, context_rounds: int = 100):
@@ -170,19 +349,14 @@ _CHAPTER_SPECIAL_TITLES = {
 }
 
 _STRONG_CHAPTER_PATTERNS = [
-    # 第15章 / 第 15 章 / 第十五章 / 第 十五 章 / 第十五章：归来 / 第十五卷
     r'^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s*(?:[：:·\-—.．、]\s*.*)?$',
     r'^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s+.*$',
-
-    # chapter 15 / CHAPTER 15 / chapter iv
     r'^chapter\s*\d+\s*(?:[:：.\-—]\s*.*)?$',
     r'^chapter\s*[ivxlcdm]+\s*(?:[:：.\-—]\s*.*)?$',
 ]
 
 _WEAK_CHAPTER_PATTERNS = [
-    # 1、这一天 / 1. 这一天 / 1-这一天 / 1 — 这一天
     r'^\d+\s*[、.．\-—]\s*.+$',
-    # 1 这一天 / 001 重生
     r'^\d+\s+.+$',
 ]
 
@@ -197,21 +371,17 @@ def _normalize_chapter_line(line: str) -> str:
 
 
 def _is_special_chapter_title(line: str) -> bool:
-    normalized = _normalize_chapter_line(line)
-    return normalized in _CHAPTER_SPECIAL_TITLES
+    return _normalize_chapter_line(line) in _CHAPTER_SPECIAL_TITLES
 
 
 def _is_strong_chapter_title(line: str) -> bool:
     normalized = _normalize_chapter_line(line)
     if not normalized:
         return False
-
     if _is_special_chapter_title(normalized):
         return True
-
     if len(normalized) > 80:
         return False
-
     for pattern in _STRONG_CHAPTER_PATTERNS:
         if re.match(pattern, normalized, re.IGNORECASE):
             return True
@@ -222,10 +392,8 @@ def _is_weak_chapter_title(line: str) -> bool:
     normalized = _normalize_chapter_line(line)
     if not normalized:
         return False
-
     if len(normalized) > 60:
         return False
-
     for pattern in _WEAK_CHAPTER_PATTERNS:
         if re.match(pattern, normalized, re.IGNORECASE):
             return True
@@ -233,10 +401,6 @@ def _is_weak_chapter_title(line: str) -> bool:
 
 
 def _collect_following_text_length(lines: list, start_index: int, max_lookahead: int = 8) -> int:
-    """
-    从 start_index 之后向下看几行，统计像正文的总长度
-    用于辅助判断弱标题是否可信
-    """
     total_len = 0
     for i in range(start_index + 1, min(len(lines), start_index + 1 + max_lookahead)):
         text = _normalize_chapter_line(lines[i])
@@ -263,11 +427,6 @@ def _count_chapter_signal_lines(lines: list):
 
 
 def _is_chapter_title_with_context(lines: list, index: int, strong_count: int, weak_count: int) -> bool:
-    """
-    带上下文的章节判断：
-    - 强标题：直接认
-    - 弱标题：尽量匹配，但增加少量上下文判断，避免太离谱的误判
-    """
     raw_line = lines[index]
     normalized = _normalize_chapter_line(raw_line)
     if not normalized:
@@ -279,23 +438,16 @@ def _is_chapter_title_with_context(lines: list, index: int, strong_count: int, w
     if not _is_weak_chapter_title(normalized):
         return False
 
-    # 尽可能匹配：只做轻度约束，不做过强拦截
-    # 1) 如果全文完全是弱章节模式小说，就允许匹配
-    # 2) 如果全文同时有强章节模式，也仍允许弱标题出现（有些小说混用）
-    # 3) 但如果后面几乎没有正文，也不像章节
     following_len = _collect_following_text_length(lines, index, max_lookahead=8)
     if following_len >= 12:
         return True
 
-    # 如果弱章节信号很多，也接受
     if weak_count >= 3:
         return True
 
-    # 如果这一行形式非常典型，也接受
     if re.match(r'^\d+\s*[、.．\-—]\s*.+$', normalized, re.IGNORECASE):
         return True
 
-    # 最后的兜底：纯数字+空格标题，如果全文至少有一本像小说章节的结构，也接受
     if strong_count + weak_count >= 2 and re.match(r'^\d+\s+.+$', normalized, re.IGNORECASE):
         return True
 
@@ -323,12 +475,12 @@ def _parse_chapters(content: str) -> list:
 
         if _is_chapter_title_with_context(lines, idx, strong_count, weak_count):
             if current_chapter is not None:
-                chapter_text = '\n'.join(current_lines).strip()
+                chapter_text = "\n".join(current_lines).strip()
                 if chapter_text:
                     chapters.append({
-                        'title': current_chapter,
-                        'content': chapter_text,
-                        'index': len(chapters) + 1
+                        "title": current_chapter,
+                        "content": chapter_text,
+                        "index": len(chapters) + 1
                     })
             current_chapter = stripped
             current_lines = []
@@ -337,109 +489,196 @@ def _parse_chapters(content: str) -> list:
                 current_lines.append(raw_line)
 
     if current_chapter is not None:
-        chapter_text = '\n'.join(current_lines).strip()
+        chapter_text = "\n".join(current_lines).strip()
         if chapter_text:
             chapters.append({
-                'title': current_chapter,
-                'content': chapter_text,
-                'index': len(chapters) + 1
+                "title": current_chapter,
+                "content": chapter_text,
+                "index": len(chapters) + 1
             })
 
     return chapters
 
 
-# ==================== 批处理核心 ====================
+def _slice_chapters(chapters: list, start_chapter: int = None, end_chapter: int = None):
+    total = len(chapters)
+    if total == 0:
+        return [], 0, 0
 
-# LLM API 调用重试配置
-LLM_MAX_RETRIES = 3
-LLM_RETRY_DELAY = 5  # 秒
+    start = _safe_int(start_chapter, 1, min_value=1, max_value=total)
+    end = _safe_int(end_chapter, total, min_value=1, max_value=total)
+    if start > end:
+        start, end = end, start
 
-
-def _call_llm_api_with_retry(config: dict, messages: list, max_retries: int = LLM_MAX_RETRIES, use_stream: bool = True):
-    """
-    带重试机制的 LLM API 调用
-
-    Args:
-        config: 配置字典
-        messages: 消息列表
-        max_retries: 最大重试次数
-        use_stream: 是否使用流式响应（批处理默认使用流式）
-
-    Returns:
-        (success, result) - 成功时result是响应JSON，失败时result是错误信息
-    """
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        success, result = _call_llm_api(config, messages, use_stream=use_stream)
-        if success:
-            return True, result
-        last_error = result
-        logger.warning(f"LLM API 调用失败 (第 {attempt}/{max_retries} 次): {last_error}")
-        if attempt < max_retries:
-            time.sleep(LLM_RETRY_DELAY * attempt)  # 递增等待
-    return False, last_error
+    selected = chapters[start - 1:end]
+    return selected, start, end
 
 
-def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: dict, start_batch: int = 0, delay_min: int = 15, delay_max: int = 45):
-    """
-    在独立线程中处理一本小说文档
-    - 不同线程处理不同小说文档
-    - 每本小说按批次处理章节（如每批次10章）
-    - 每个批次：系统提示词 + 批次章节内容 → 发送给 LLM API
-    - 处理完所有批次后 → 上传 HF 数据集
-    - 支持从指定批次开始恢复运行
-    - 批次间随机延迟避免限速
-    """
+# ==================== 任务 / 文件状态辅助 ====================
+
+def _mark_file_processing(task_id: str, file_idx: int):
+    task = task_store.get_task_ref(task_id)
+    if not task:
+        return
+    files = task.get("files", [])
+    if 0 <= file_idx < len(files):
+        files[file_idx]["status"] = "processing"
+        files[file_idx]["message"] = "处理中..."
+
+
+def _mark_file_terminal(task_id: str, file_idx: int, status: str, message: str = ""):
+    task = task_store.get_task_ref(task_id)
+    if not task:
+        return
+    files = task.get("files", [])
+    if 0 <= file_idx < len(files):
+        files[file_idx]["status"] = status
+        files[file_idx]["message"] = message
+
+
+def _append_file_result(task_id: str, file_idx: int, result: dict):
+    task = task_store.get_task_ref(task_id)
+    if not task:
+        return False
+
+    files = task.get("files", [])
+    if not (0 <= file_idx < len(files)):
+        return False
+
+    file_info = files[file_idx]
+    file_info.setdefault("results", []).append(result)
+
+    chapter_count = _safe_int(result.get("chapter_count", 0), 0, min_value=0)
+    if result.get("success"):
+        file_info["completed"] = file_info.get("completed", 0) + chapter_count
+    else:
+        file_info["failed"] = file_info.get("failed", 0) + chapter_count
+
+    return True
+
+
+def _update_task_aggregate_progress(task_id: str):
+    task = task_store.get_task_ref(task_id)
+    if not task:
+        return
+
+    total = 0
+    completed = 0
+    failed = 0
+    queued = 0
+    processing = 0
+
+    for f in task.get("files", []):
+        total += f.get("total", 0)
+        completed += f.get("completed", 0)
+        failed += f.get("failed", 0)
+        status = f.get("status")
+        if status == "queued":
+            queued += 1
+        elif status == "processing":
+            processing += 1
+
+    task["total_chapters"] = total
+    task["completed_chapters"] = completed
+    task["failed_chapters"] = failed
+
+    if task.get("status") == "cancelled":
+        task["progress"] = f"{completed}/{total}"
+        task["message"] = f"任务已取消: {completed}/{total}"
+        return
+
+    task["progress"] = f"{completed}/{total}"
+
+    if processing > 0:
+        task["status"] = "processing"
+        task["message"] = f"处理中：完成 {completed}/{total}，排队文件 {queued}"
+    elif queued > 0:
+        task["status"] = "pending"
+        task["message"] = f"等待处理：完成 {completed}/{total}，排队文件 {queued}"
+
+
+def _update_task_status_if_finished(task_id: str):
+    task = task_store.get_task_ref(task_id)
+    if not task:
+        return
+
+    files = task.get("files", [])
+    if not files:
+        task_store.update_task(task_id, {"status": "completed", "progress": "完成", "message": "无文件"})
+        return
+
+    file_statuses = [f.get("status", "queued") for f in files]
+    terminal = {"completed", "failed", "partial_failed", "cancelled"}
+
+    _update_task_aggregate_progress(task_id)
+
+    if task.get("status") == "cancelled":
+        return
+
+    if all(s in terminal for s in file_statuses):
+        completed = task.get("completed_chapters", 0)
+        failed = task.get("failed_chapters", 0)
+        total = task.get("total_chapters", 0)
+
+        if failed > 0:
+            task["status"] = "partial_failed"
+            task["progress"] = f"{completed}/{total}"
+            task["message"] = f"批处理完成，但存在失败章节: 成功 {completed}/{total}，失败 {failed}"
+        else:
+            task["status"] = "completed"
+            task["progress"] = "完成"
+            task["message"] = f"批处理完成: {completed}/{total}"
+
+
+# ==================== 单本小说处理 ====================
+
+def _process_single_book(task_id: str, file_idx: int):
+    task = task_store.get_task(task_id)
+    if not task:
+        return
+
+    files = task.get("files", [])
+    if not (0 <= file_idx < len(files)):
+        return
+
+    file_info = files[file_idx]
+    config = file_info.get("resolved_config", {})
+    chapters = list(file_info.get("chapters", []))
+    batch_size = max(1, _safe_int(file_info.get("batch_size", DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1))
+    delay_min = _safe_int(file_info.get("delay_min", BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
+    delay_max = _safe_int(file_info.get("delay_max", BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=delay_min)
+    file_name = file_info.get("file_name", "未命名")
+
+    if not chapters:
+        _mark_file_terminal(task_id, file_idx, "failed", "没有可处理章节")
+        fingerprint = file_info.get("fingerprint")
+        _release_dedup_if_terminal(fingerprint, "failed")
+        _update_task_status_if_finished(task_id)
+        return
+
+    system_prompt = config.get("batchSystemPrompt", config.get("systemPrompt", "You are a helpful AI assistant."))
+    user_prompt_template = config.get("batchUserPromptTemplate", "")
+    context_messages = []
+
+    total_chapters = len(chapters)
+    total_batches = (total_chapters + batch_size - 1) // batch_size
+
+    logger.info(f"[{task_id}] 开始处理单本小说 [{file_name}]，共 {total_chapters} 章，{total_batches} 批，每批 {batch_size} 章")
+
     try:
-        logger.info(f"[线程{file_idx}] 开始执行 process_single_novel, task_id={task_id}")
-        task = task_store.get_task_ref(task_id)
-        logger.info(f"[线程{file_idx}] 任务状态: {task.get('status') if task else 'None'}")
-        if not task or task.get("status") in ("cancelled", "completed"):
-            logger.warning(f"[线程{file_idx}] 任务不存在或已完成，跳过")
-            return
-
-        # 获取章节列表（深拷贝，避免共享引用问题）
-        chapters = list(file_info.get("chapters", []))
-        batch_size = max(1, _safe_int(file_info.get("batch_size", DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1))
-        file_name = file_info.get("file_name", "未命名")
-
-        # 获取提示词配置
-        system_prompt = config.get("batchSystemPrompt", config.get("systemPrompt", "You are a helpful AI assistant."))
-        user_prompt_template = config.get("batchUserPromptTemplate", "")
-
-        # 确保延迟范围有效
-        delay_min = max(0, _safe_int(delay_min, 15, min_value=0))
-        delay_max = max(delay_min, _safe_int(delay_max, 45, min_value=0))
-
-        # 上下文历史
-        context_messages = []
-
-        total_chapters = len(chapters)
-        total_batches = (total_chapters + batch_size - 1) // batch_size if total_chapters > 0 else 0
-
-        logger.info(f"[线程{file_idx}] 开始处理 [{file_name}] 共 {total_chapters} 章, 分 {total_batches} 批次, 每批 {batch_size} 章, 从批次 {start_batch + 1} 开始, 延迟 {delay_min}-{delay_max}秒")
-
-        if total_chapters == 0:
-            logger.warning(f"[线程{file_idx}] [{file_name}] 没有章节可处理，跳过")
-            return
-
-        # 按批次处理
-        for batch_index in range(start_batch, total_batches):
-            # 检查任务是否被取消
-            task = task_store.get_task_ref(task_id)
-            if not task or task.get("status") == "cancelled":
-                task_store.update_task(task_id, {"status": "cancelled", "message": "任务已取消"})
+        for batch_index in range(total_batches):
+            current_task = task_store.get_task_ref(task_id)
+            if not current_task or current_task.get("status") == "cancelled":
+                _mark_file_terminal(task_id, file_idx, "cancelled", "任务已取消")
+                fingerprint = file_info.get("fingerprint")
+                _release_dedup_if_terminal(fingerprint, "cancelled")
                 return
 
-            # 计算当前批次的章节范围
             batch_start = batch_index * batch_size
             batch_end = min(batch_start + batch_size, total_chapters)
-            batch_chapters = chapters[batch_start:batch_end]
             batch_num = batch_index + 1
+            batch_chapters = chapters[batch_start:batch_end]
 
-            logger.info(f"[线程{file_idx}] [{file_name}] 处理批次 {batch_num}/{total_batches}: 章节 {batch_start+1}-{batch_end} (共 {len(batch_chapters)} 章)")
-
-            # 构建当前批次的章节内容
             batch_content_parts = []
             for ch in batch_chapters:
                 title = ch.get("title", "未命名章节")
@@ -447,37 +686,33 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
                 batch_content_parts.append(f"\n\n=== {title} ===\n\n{content}")
             batch_content = "".join(batch_content_parts)
 
-            # 构建用户消息
             if user_prompt_template:
                 user_message = user_prompt_template.replace("{content}", batch_content)
             else:
                 user_message = batch_content
 
-            # 构建消息列表
             messages = [{"role": "system", "content": system_prompt}]
-
-            # 添加上一个批次的上下文（只保留 n-1 批次的 user+assistant）
-            max_context_batches = 1
-            recent_context = context_messages[-(max_context_batches * 2):]
+            recent_context = context_messages[-2:]
             messages.extend(recent_context)
-
-            # 添加当前批次的用户消息
             messages.append({"role": "user", "content": user_message})
 
-            logger.info(f"[线程{file_idx}] 批次 {batch_num}/{total_batches} 发送给 LLM: {len(messages)} 条消息, 用户消息长度: {len(user_message)} 字符")
+            logger.info(f"[{task_id}] [{file_name}] 处理批次 {batch_num}/{total_batches}，章节 {batch_start + 1}-{batch_end}")
 
-            # 调用 LLM API（带重试）
-            success, result = _call_llm_api_with_retry(config, messages)
+            success, result = _call_llm_batch_with_retry(
+                config=config,
+                messages=messages,
+                task_id=task_id,
+                delay_min=delay_min,
+                delay_max=delay_max,
+                max_retries=_safe_int(config.get("batchRetryCount", 3), 3, min_value=1, max_value=10)
+            )
 
             if success:
                 assistant_message = _extract_assistant_content(result)
-
-                # 保存上下文
                 context_messages.append({"role": "user", "content": user_message})
                 context_messages.append({"role": "assistant", "content": assistant_message})
 
-                # 整个批次存为一条结果
-                batch_result = {
+                _append_file_result(task_id, file_idx, {
                     "batch": batch_num,
                     "total_batches": total_batches,
                     "chapter_start": batch_start + 1,
@@ -488,31 +723,21 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
                     "result": assistant_message,
                     "preview": assistant_message[:300] + ("..." if len(assistant_message) > 300 else ""),
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                }
-                task_store.append_file_result(task_id, file_idx, batch_result)
+                })
 
-                # 更新进度
-                task = task_store.get_task(task_id)
-                if task:
-                    completed = task.get("completed_chapters", 0) + len(batch_chapters)
-                    total = task.get("total_chapters", 0)
-                    task_store.update_task(task_id, {
-                        "completed_chapters": completed,
-                        "progress": f"{completed}/{total}",
-                        "message": f"[{file_name}] 批次 {batch_num}/{total_batches} 完成 ({completed}/{total})"
-                    })
+                _update_task_aggregate_progress(task_id)
 
-                logger.info(f"[线程{file_idx}] [{file_name}] 批次 {batch_num}/{total_batches} 处理成功")
-
-                # 批次间随机延迟（最后一个批次不延迟）
-                if batch_index < total_batches - 1 and delay_max > 0:
-                    delay = random.randint(delay_min, delay_max)
-                    logger.info(f"[线程{file_idx}] [{file_name}] 批次 {batch_num} 完成，等待 {delay} 秒后继续...")
-                    time.sleep(delay)
+                if batch_index < total_batches - 1:
+                    delay = _random_delay_seconds(delay_min, delay_max)
+                    logger.info(f"[{task_id}] [{file_name}] 批次 {batch_num} 完成，等待 {delay} 秒处理下一批")
+                    if not _sleep_with_cancel_check(task_id, delay):
+                        _mark_file_terminal(task_id, file_idx, "cancelled", "任务已取消")
+                        fingerprint = file_info.get("fingerprint")
+                        _release_dedup_if_terminal(fingerprint, "cancelled")
+                        return
             else:
-                # 处理失败 - 整个批次存为一条失败记录
-                logger.error(f"[线程{file_idx}] [{file_name}] 批次 {batch_num}/{total_batches} 处理失败: {result}")
-                batch_result = {
+                logger.error(f"[{task_id}] [{file_name}] 批次 {batch_num} 最终失败: {result}")
+                _append_file_result(task_id, file_idx, {
                     "batch": batch_num,
                     "total_batches": total_batches,
                     "chapter_start": batch_start + 1,
@@ -523,161 +748,43 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
                     "error": str(result),
                     "preview": "",
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                }
-                task_store.append_file_result(task_id, file_idx, batch_result)
+                })
+                _update_task_aggregate_progress(task_id)
 
-                task = task_store.get_task(task_id)
-                if task:
-                    failed = task.get("failed_chapters", 0) + len(batch_chapters)
-                    task_store.update_task(task_id, {"failed_chapters": failed})
+        # 单本完成后上传
+        _upload_single_novel_result(task_id, file_idx)
+        current_task = task_store.get_task_ref(task_id)
+        if current_task and current_task.get("status") != "cancelled":
+            file_status = "completed" if files[file_idx].get("failed", 0) == 0 else "partial_failed"
+            _mark_file_terminal(task_id, file_idx, file_status, "处理完成")
+            fingerprint = file_info.get("fingerprint")
+            _release_dedup_if_terminal(fingerprint, file_status)
 
-        logger.info(f"[线程{file_idx}] [{file_name}] 全部 {total_batches} 批次处理完成")
-
-    except Exception as e:
-        logger.error(f"[线程{file_idx}] 书籍处理异常 [{task_id}] [{file_info.get('file_name', 'unknown')}]: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def _run_batch_task(task_id: str, resume: bool = False, delay_min: int = None, delay_max: int = None):
-    """
-    执行批处理任务（多文件并行）
-    - 每本书一个线程
-    - 线程池控制并发
-    - 支持从失败处恢复运行
-    """
-    try:
-        task = task_store.get_task(task_id)
-        if not task:
-            return
-
-        files = task.get("files", [])
-
-        # 使用传入的延迟配置，如果没有则使用默认值
-        actual_delay_min = delay_min if delay_min is not None else BATCH_DELAY_MIN
-        actual_delay_max = delay_max if delay_max is not None else BATCH_DELAY_MAX
-
-        if not resume:
-            # 新任务：初始化计数
-            total_chapters = sum(f.get("total", 0) for f in files)
-            task_store.update_task(task_id, {
-                "status": "processing",
-                "total_chapters": total_chapters,
-                "completed_chapters": 0,
-                "failed_chapters": 0,
-                "progress": f"0/{total_chapters}",
-                "message": "开始处理..."
-            })
-        else:
-            # 恢复任务：保持已有进度，只更新状态
-            task_store.update_task(task_id, {
-                "status": "processing",
-                "message": "从失败处恢复运行..."
-            })
-
-        # 为每本书创建独立线程
-        threads = []
-        for file_idx, file_info in enumerate(files):
-            # 检查任务是否被取消
-            task = task_store.get_task_ref(task_id)
-            if not task or task.get("status") == "cancelled":
-                task_store.update_task(task_id, {"status": "cancelled", "message": "任务已取消"})
-                return
-
-            # 获取预解析的配置
-            config = file_info.get("resolved_config", {})
-
-            # 计算该文件的起始批次（恢复模式）
-            start_batch = 0
-            if resume:
-                results = file_info.get("results", [])
-                # 找到第一个失败或未处理的批次
-                processed_batches = set()
-                for r in results:
-                    if r.get("success"):
-                        processed_batches.add(r.get("batch", 0))
-
-                # 找到第一个未成功处理的批次
-                file_batch_size = max(1, _safe_int(file_info.get("batch_size", DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1))
-                total_batches = (file_info.get("total", 0) + file_batch_size - 1) // file_batch_size
-                for b in range(1, total_batches + 1):
-                    if b not in processed_batches:
-                        start_batch = b - 1  # 转换为0-based索引
-                        break
-
-                if start_batch > 0:
-                    logger.info(f"[恢复] 文件 {file_info.get('file_name')} 从批次 {start_batch + 1} 继续")
-
-            # 创建线程 - 每个线程独立处理一本小说文档
-            thread = threading.Thread(
-                target=process_single_novel,
-                args=(task_id, file_idx, file_info, config, start_batch, actual_delay_min, actual_delay_max)
-            )
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-            logger.info(f"启动线程 {file_idx} 处理小说: {file_info.get('file_name', 'unknown')}")
-
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join()
-
-        # 每本小说处理完后立即上传结果到 HF 数据集
-        task = task_store.get_task(task_id)
-        if not task:
-            return
-
-        for file_idx, file_info in enumerate(task.get("files", [])):
-            _upload_single_novel_result(task_id, file_idx, file_info)
-
-        # 完成状态判定
-        task = task_store.get_task(task_id)
-        if not task:
-            return
-
-        completed = task.get("completed_chapters", 0)
-        failed = task.get("failed_chapters", 0)
-        total = task.get("total_chapters", 0)
-
-        if task.get("status") == "cancelled":
-            return
-
-        final_status = "completed" if failed == 0 else "partial_failed"
-        final_progress = "完成" if failed == 0 else f"{completed}/{total}"
-        final_message = (
-            f"批处理完成: {completed}/{total}"
-            if failed == 0
-            else f"批处理完成，但存在失败章节: 成功 {completed}/{total}，失败 {failed}"
-        )
-
-        task_store.update_task(task_id, {
-            "status": final_status,
-            "progress": final_progress,
-            "message": final_message
-        })
+        _update_task_status_if_finished(task_id)
 
     except Exception as e:
-        logger.error(f"批处理任务异常 [{task_id}]: {e}")
-        import traceback
-        traceback.print_exc()
-        task_store.update_task(task_id, {"status": "failed", "message": str(e)})
+        logger.error(f"[{task_id}] 单本书处理异常 [{file_name}]: {e}", exc_info=True)
+        _mark_file_terminal(task_id, file_idx, "failed", str(e))
+        fingerprint = file_info.get("fingerprint")
+        _release_dedup_if_terminal(fingerprint, "failed")
+        _update_task_status_if_finished(task_id)
 
 
-def _upload_single_novel_result(task_id: str, file_idx: int, file_info: dict):
-    """单本小说处理完成后，立即上传结果到 HF 数据集（小说名-节奏.txt）"""
+def _upload_single_novel_result(task_id: str, file_idx: int):
     task = task_store.get_task(task_id)
     if not task:
         return
 
-    # 从文件配置或默认配置获取 HF token/dataset
-    config = file_info.get("resolved_config", {})
-    hf_token = config.get("hfToken", "")
-    hf_dataset = config.get("hfDataset", "")
+    files = task.get("files", [])
+    if not (0 <= file_idx < len(files)):
+        return
 
-    if not hf_token or not hf_dataset:
-        default_config = task.get("default_config", {})
-        hf_token = hf_token or default_config.get("hfToken", "")
-        hf_dataset = hf_dataset or default_config.get("hfDataset", "")
+    file_info = files[file_idx]
+    config = file_info.get("resolved_config", {})
+    default_config = task.get("default_config", {})
+
+    hf_token = config.get("hfToken") or default_config.get("hfToken", "")
+    hf_dataset = config.get("hfDataset") or default_config.get("hfDataset", "")
 
     if not hf_token or not hf_dataset:
         logger.warning(f"[{task_id}] 未配置 HF Token/Dataset，跳过上传")
@@ -685,19 +792,16 @@ def _upload_single_novel_result(task_id: str, file_idx: int, file_info: dict):
         return
 
     file_name = file_info.get("file_name", "未命名")
-    # 清理文件名
-    safe_name = file_name.replace(" ", "_").replace("/", "_").replace("\\", "_").replace("\n", "").replace("\r", "")
-    safe_name = safe_name[:80]
+    safe_name = _sanitize_filename(file_name)
+    filename = f"{safe_name}-节奏.txt"
 
     try:
-        from app.services.hf_dataset_service import hf_dataset_service
-
-        # 构建纯文本内容（不是 JSON）
-        text_parts = []
-        text_parts.append(f"小说: {file_name}")
-        text_parts.append(f"任务ID: {task_id}")
-        text_parts.append(f"处理时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        text_parts.append(f"{'='*60}\n")
+        text_parts = [
+            f"小说: {file_name}",
+            f"任务ID: {task_id}",
+            f"处理时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"{'=' * 60}\n"
+        ]
 
         results = file_info.get("results", [])
         for r in results:
@@ -712,29 +816,27 @@ def _upload_single_novel_result(task_id: str, file_idx: int, file_info: dict):
             text_parts.append("\n")
 
         content = "\n".join(text_parts)
-        filename = f"{safe_name}-节奏.txt"
-
+        from app.services.hf_dataset_service import hf_dataset_service
         hf_dataset_service.upload_text_file(hf_token, hf_dataset, filename, content)
 
-        # 记录上传成功
         uploaded = task.get("result_files", [])
-        uploaded.append(filename)
+        if filename not in uploaded:
+            uploaded.append(filename)
         task_store.update_task(task_id, {
             "result_persisted": True,
             "result_files": uploaded
         })
-        logger.info(f"小说 [{file_name}] 结果已上传到 HF 数据集: {filename}")
+        logger.info(f"[{task_id}] 小说 [{file_name}] 结果已上传到 HF 数据集: {filename}")
 
     except Exception as e:
-        logger.error(f"上传小说结果失败 [{file_name}]: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"[{task_id}] 上传小说结果失败 [{file_name}]: {e}", exc_info=True)
         task_store.update_task(task_id, {"result_persist_error": str(e)})
 
 
 # ==================== 路由注册 ====================
 
 def register_routes(app):
+    _ensure_workers()
 
     @app.route('/')
     def index():
@@ -742,6 +844,7 @@ def register_routes(app):
 
     @app.route('/api/health')
     def health():
+        worker_stats = _get_worker_stats()
         return jsonify({
             'status': 'ok',
             'timestamp': int(time.time() * 1000),
@@ -750,7 +853,9 @@ def register_routes(app):
             'batch_size': DEFAULT_BATCH_SIZE,
             'batch_delay_min': BATCH_DELAY_MIN,
             'batch_delay_max': BATCH_DELAY_MAX,
-            'available_slots': _get_available_slots()
+            'workerCount': worker_stats['workerCount'],
+            'aliveWorkers': worker_stats['aliveWorkers'],
+            'queueSize': worker_stats['queueSize'],
         })
 
     # ==================== 设置 ====================
@@ -758,7 +863,6 @@ def register_routes(app):
     @app.route('/api/settings', methods=['GET'])
     def get_settings():
         settings = app_settings_service.get_default_runtime_config()
-        # 添加延迟配置
         settings['batchDelayMin'] = BATCH_DELAY_MIN
         settings['batchDelayMax'] = BATCH_DELAY_MAX
         return jsonify({
@@ -768,36 +872,29 @@ def register_routes(app):
 
     @app.route('/api/settings/update', methods=['POST'])
     def update_settings():
-        """更新默认配置（仅非敏感字段）"""
         data = request.json or {}
         app_settings_service.update_user_defaults(data)
         return jsonify({'success': True, 'settings': app_settings_service.get_default_runtime_config()})
 
     @app.route('/api/set-concurrent', methods=['POST'])
     def set_concurrent():
-        global MAX_CONCURRENT_TASKS, task_semaphore
+        global MAX_CONCURRENT_TASKS
         data = request.json or {}
         value = _safe_int(data.get('maxConcurrent', 10), 10, min_value=1, max_value=50)
         MAX_CONCURRENT_TASKS = value
-        task_semaphore = threading.Semaphore(value)
-        logger.info(f"并发数调整为: {value}")
+        logger.info(f"maxConcurrent 调整为: {value}")
         return jsonify({'success': True, 'maxConcurrent': value})
 
     @app.route('/api/set-thread-pool', methods=['POST'])
     def set_thread_pool():
-        """设置线程池大小"""
-        global DEFAULT_THREAD_POOL_SIZE, executor
         data = request.json or {}
         value = _safe_int(data.get('threadPoolSize', 10), 10, min_value=1, max_value=100)
-        DEFAULT_THREAD_POOL_SIZE = value
-        # 重新创建线程池
-        executor = ThreadPoolExecutor(max_workers=value)
-        logger.info(f"线程池大小调整为: {value}")
+        _restart_workers(value)
+        logger.info(f"工作线程数调整为: {value}")
         return jsonify({'success': True, 'threadPoolSize': value})
 
     @app.route('/api/set-batch-delay', methods=['POST'])
     def set_batch_delay():
-        """设置批次间延迟范围（秒）"""
         global BATCH_DELAY_MIN, BATCH_DELAY_MAX
         data = request.json or {}
         min_val = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
@@ -813,6 +910,7 @@ def register_routes(app):
 
     @app.route('/api/status', methods=['GET'])
     def get_status():
+        worker_stats = _get_worker_stats()
         return jsonify({
             'success': True,
             'maxConcurrent': MAX_CONCURRENT_TASKS,
@@ -820,8 +918,9 @@ def register_routes(app):
             'batchSize': DEFAULT_BATCH_SIZE,
             'batchDelayMin': BATCH_DELAY_MIN,
             'batchDelayMax': BATCH_DELAY_MAX,
-            'availableSlots': _get_available_slots(),
-            'taskCount': task_store.task_count()
+            'taskCount': task_store.task_count(),
+            'queueSize': worker_stats['queueSize'],
+            'aliveWorkers': worker_stats['aliveWorkers'],
         })
 
     # ==================== 配置管理 ====================
@@ -839,23 +938,17 @@ def register_routes(app):
         config_id = data.get('id') or str(uuid.uuid4())
         config_data = {
             "name": data.get('name', '未命名配置'),
-            # 聊天功能提示词
             "systemPrompt": data.get('systemPrompt', ''),
-            # 批处理功能提示词（独立配置）
             "batchSystemPrompt": data.get('batchSystemPrompt', ''),
             "batchUserPromptTemplate": data.get('batchUserPromptTemplate', ''),
-            # 批次大小
             "batchSize": data.get('batchSize', ''),
-            # 模型配置
             "model": data.get('model', ''),
             "temperature": data.get('temperature', ''),
             "topP": data.get('topP', ''),
             "contextRounds": data.get('contextRounds', ''),
             "maxOutputTokens": data.get('maxOutputTokens', ''),
-            # API配置
             "apiHost": data.get('apiHost', ''),
             "apiKey": data.get('apiKey', ''),
-            # HF配置
             "hfToken": data.get('hfToken', ''),
             "hfDataset": data.get('hfDataset', ''),
         }
@@ -916,22 +1009,18 @@ def register_routes(app):
         if not user_message:
             return jsonify({'success': False, 'error': '消息不能为空'}), 400
 
-        # 解析配置（在请求上下文中解析）
         config = app_settings_service.resolve_config_from_id(user_id, config_id)
-        # 聊天功能使用 systemPrompt
         system_prompt = config.get('systemPrompt', '')
         context_rounds = _safe_int(config.get('contextRounds', 100), 100, min_value=0)
 
-        # 添加用户消息
         user_msg = {'role': 'user', 'content': user_message, 'time': int(time.time() * 1000)}
         conversation_store.add_message(user_id, conv_id, user_msg)
 
-        # 获取历史
         conv = conversation_store.get_conversation(user_id, conv_id)
         history = conv.get('messages', []) if conv else []
         messages = _build_messages(system_prompt, history[:-1], user_message, context_rounds)
 
-        success, result = _call_llm_api(config, messages)
+        success, result = _call_llm_api(config, messages, use_stream=False)
 
         if success:
             assistant_message = _extract_assistant_content(result)
@@ -954,16 +1043,10 @@ def register_routes(app):
 
     @app.route('/api/batch', methods=['POST'])
     def submit_batch():
-        """
-        提交多文件批处理任务
-        - 在请求上下文中预解析配置
-        - 每本书将独立线程处理
-        """
         data = request.json or {}
         user_id = data.get('userId', 'default')
         files = data.get('files', [])
         batch_size = _safe_int(data.get('batchSize', DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1)
-        # 获取延迟配置
         delay_min = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
         delay_max = _safe_int(data.get('delayMax', BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=delay_min)
 
@@ -973,43 +1056,84 @@ def register_routes(app):
         task_id = str(uuid.uuid4())
         task_files = []
         total_chapters = 0
+        duplicate_files = []
 
-        # 获取默认配置（用于持久化）
         default_config = app_settings_service.get_full_config()
 
         for f in files:
-            chapters = f.get('chapters', [])
+            chapters = f.get('chapters', []) or []
+            if not chapters:
+                continue
+
             config_id = f.get('configId', '')
             config_name = f.get('configName', '默认配置')
             file_batch_size = _safe_int(f.get('batchSize', batch_size), batch_size, min_value=1)
+            start_chapter = _safe_int(f.get('startChapter', 1), 1, min_value=1)
+            end_chapter = f.get('endChapter')
+            end_chapter = _safe_int(end_chapter, len(chapters), min_value=1, max_value=max(1, len(chapters)))
 
-            # 在请求上下文中解析配置（关键：避免后台线程中的应用上下文问题）
             resolved_config = app_settings_service.resolve_config_from_id(user_id, config_id)
-
-            # 如果配置中有批次大小，使用配置中的
             if resolved_config.get('batchSize'):
                 file_batch_size = _safe_int(resolved_config['batchSize'], file_batch_size, min_value=1)
 
-            # 获取配置名（如果提供了 configId）
             if config_id and config_id != "__default__":
                 cfg = conversation_config_store.get_config_full(user_id, config_id)
                 if cfg:
                     config_name = cfg.get('name', config_name)
 
+            selected_chapters, actual_start, actual_end = _slice_chapters(chapters, start_chapter, end_chapter)
+            if not selected_chapters:
+                continue
+
+            file_name = f.get('fileName', '未命名')
+            fingerprint = _build_book_fingerprint(
+                file_name=file_name,
+                chapters=selected_chapters,
+                config_id=config_id,
+                batch_size=file_batch_size,
+                start_chapter=actual_start,
+                end_chapter=actual_end
+            )
+
+            duplicate = _check_duplicate_fingerprint(fingerprint)
+            if duplicate:
+                duplicate_files.append({
+                    "fileName": file_name,
+                    "taskId": duplicate.get("task_id"),
+                    "status": duplicate.get("status"),
+                    "message": f"《{file_name}》已在队列或处理中"
+                })
+                continue
+
             task_files.append({
-                "file_name": f.get('fileName', '未命名'),
+                "file_name": file_name,
                 "config_id": config_id,
                 "config_name": config_name,
-                "chapters": chapters,
+                "chapters": selected_chapters,
                 "batch_size": file_batch_size,
+                "delay_min": delay_min,
+                "delay_max": delay_max,
                 "results": [],
                 "completed": 0,
                 "failed": 0,
-                "total": len(chapters),
-                # 预解析的配置（包含所有必要字段）
+                "total": len(selected_chapters),
+                "status": "queued",
+                "message": "排队中...",
+                "start_chapter": actual_start,
+                "end_chapter": actual_end,
+                "fingerprint": fingerprint,
                 "resolved_config": resolved_config,
             })
-            total_chapters += len(chapters)
+            total_chapters += len(selected_chapters)
+
+        if not task_files:
+            if duplicate_files:
+                return jsonify({
+                    'success': False,
+                    'error': '提交内容全部重复，未进入队列',
+                    'duplicates': duplicate_files
+                }), 409
+            return jsonify({'success': False, 'error': '没有可处理文件'}), 400
 
         task_data = {
             'task_id': task_id,
@@ -1020,19 +1144,29 @@ def register_routes(app):
             'completed_chapters': 0,
             'failed_chapters': 0,
             'progress': f'0/{total_chapters}',
-            'message': '等待处理...',
+            'message': '等待排队...',
             'created_at': time.time(),
-            # 保存默认配置用于持久化
             'default_config': default_config,
+            'result_files': []
         }
         task_store.create_task(task_id, task_data)
 
-        # 启动批处理任务
-        thread = threading.Thread(target=_run_batch_task, args=(task_id, False, delay_min, delay_max))
-        thread.daemon = True
-        thread.start()
+        for idx, file_info in enumerate(task_files):
+            _register_fingerprint(file_info["fingerprint"], task_id, file_info["file_name"], "queued")
+            _book_queue.put({
+                "task_id": task_id,
+                "file_idx": idx
+            })
 
-        return jsonify({'success': True, 'taskId': task_id, 'totalChapters': total_chapters})
+        _update_task_aggregate_progress(task_id)
+
+        return jsonify({
+            'success': True,
+            'taskId': task_id,
+            'totalChapters': total_chapters,
+            'queuedFiles': len(task_files),
+            'duplicateFiles': duplicate_files
+        })
 
     @app.route('/api/batch/cancel', methods=['POST'])
     def batch_cancel():
@@ -1040,36 +1174,29 @@ def register_routes(app):
         task_id = data.get('taskId')
         if not task_id:
             return jsonify({'success': False, 'error': '缺少taskId'}), 400
-        task_store.update_task(task_id, {'status': 'cancelled'})
+
+        task = task_store.get_task_ref(task_id)
+        if not task:
+            return jsonify({'success': False, 'error': '任务不存在'}), 404
+
+        task["status"] = "cancelled"
+        task["message"] = "任务已取消"
+
+        for f in task.get("files", []):
+            if f.get("status") in ("queued", "processing"):
+                f["status"] = "cancelled"
+                fingerprint = f.get("fingerprint")
+                _release_dedup_if_terminal(fingerprint, "cancelled")
+
+        _update_task_status_if_finished(task_id)
         return jsonify({'success': True})
 
     @app.route('/api/batch/resume', methods=['POST'])
     def batch_resume():
-        """从失败处恢复运行任务"""
-        data = request.json or {}
-        task_id = data.get('taskId')
-        if not task_id:
-            return jsonify({'success': False, 'error': '缺少taskId'}), 400
-
-        task = task_store.get_task(task_id)
-        if not task:
-            return jsonify({'success': False, 'error': '任务不存在'}), 404
-
-        # 只有已取消、失败、部分失败的任务可以恢复
-        if task.get('status') not in ('cancelled', 'failed', 'partial_failed'):
-            return jsonify({'success': False, 'error': '只有已取消、失败或部分失败的任务可以恢复'}), 400
-
-        # 获取延迟配置
-        delay_min = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
-        delay_max = _safe_int(data.get('delayMax', BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=delay_min)
-
-        # 启动恢复任务
-        thread = threading.Thread(target=_run_batch_task, args=(task_id, True, delay_min, delay_max))
-        thread.daemon = True
-        thread.start()
-
-        logger.info(f"任务 {task_id} 从失败处恢复运行")
-        return jsonify({'success': True, 'message': '任务已恢复运行'})
+        return jsonify({
+            'success': False,
+            'error': '当前重构版本暂未开放 resume，请重新提交需要重跑的章节范围'
+        }), 400
 
     # ==================== 任务管理 ====================
 
@@ -1080,7 +1207,6 @@ def register_routes(app):
 
     @app.route('/api/task/<task_id>', methods=['GET'])
     def get_task_detail(task_id):
-        """获取任务详情（含结果，用于查看）"""
         task = task_store.get_task(task_id)
         if not task:
             return jsonify({'success': False, 'error': '任务不存在'}), 404
@@ -1097,7 +1223,6 @@ def register_routes(app):
 
     @app.route('/api/task/<task_id>/download', methods=['GET'])
     def download_task_results(task_id):
-        """下载任务结果为文本 - 按小说分组，按批次展示"""
         task = task_store.get_task(task_id)
         if not task:
             return jsonify({'success': False, 'error': '任务不存在'}), 404
@@ -1125,7 +1250,6 @@ def register_routes(app):
 
     @app.route('/api/task/<task_id>/download/<int:file_idx>', methods=['GET'])
     def download_single_novel(task_id, file_idx):
-        """下载单本小说的处理结果"""
         task = task_store.get_task(task_id)
         if not task:
             return jsonify({'success': False, 'error': '任务不存在'}), 404
@@ -1136,7 +1260,7 @@ def register_routes(app):
 
         f = files[file_idx]
         file_name = f.get('file_name', '未命名')
-        safe_name = file_name.replace(" ", "_").replace("/", "_").replace("\\", "_").replace("\n", "").replace("\r", "")[:80]
+        safe_name = _sanitize_filename(file_name)
 
         text_parts = []
         text_parts.append(f"小说: {file_name}")
@@ -1188,7 +1312,6 @@ def register_routes(app):
 
     @app.route('/api/hf-create-dataset', methods=['POST'])
     def hf_create_dataset():
-        """前端请求创建 private 数据集"""
         data = request.json or {}
         hf_token = data.get('hfToken', '')
         dataset_name = data.get('datasetName', '')
