@@ -1,6 +1,6 @@
 // ============================================
 // AI Workflow Assistant - Frontend
-// Final Refactor Version
+// Final Refactor Version (Aligned to current index.html)
 // ============================================
 
 const $ = (id) => document.getElementById(id);
@@ -12,7 +12,12 @@ const state = {
     // 聊天
     conversations: [],
     currentConvId: null,
+    currentConvMessages: [],
     isSending: false,
+
+    // 配置
+    configs: [],
+    editingConfigId: null,
 
     // 批处理
     batchFiles: [],
@@ -21,18 +26,13 @@ const state = {
     tasks: [],
     taskPollTimer: null,
     viewingTaskId: null,
-
-    // 配置
-    configs: [],
-    editingConfigId: null,
+    viewingTaskData: null,
 
     // 云端文件
     cloudFiles: [],
 
-    // 服务器默认配置
+    // 设置/服务端状态
     serverDefaults: {},
-
-    // 并发与默认值
     threadSettings: {
         maxConcurrent: 10,
         threadPoolSize: 10
@@ -48,6 +48,44 @@ function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+function normalizeText(text) {
+    return (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function clampInt(value, defaultValue, minValue = null, maxValue = null) {
+    let n = parseInt(value, 10);
+    if (Number.isNaN(n)) n = defaultValue;
+    if (minValue !== null) n = Math.max(minValue, n);
+    if (maxValue !== null) n = Math.min(maxValue, n);
+    return n;
+}
+
+function getVal(id, defaultValue = '') {
+    const el = $(id);
+    return el ? el.value : defaultValue;
+}
+
+function setVal(id, value) {
+    const el = $(id);
+    if (!el) return false;
+    el.value = value ?? '';
+    return true;
+}
+
+function setText(id, text) {
+    const el = $(id);
+    if (!el) return false;
+    el.textContent = text ?? '';
+    return true;
+}
+
+function formatTime(ts) {
+    if (!ts) return '-';
+    const d = new Date(ts > 9999999999 ? ts : ts * 1000);
+    if (Number.isNaN(d.getTime())) return '-';
+    return d.toLocaleString();
 }
 
 function showToast(msg, type = 'info') {
@@ -75,43 +113,22 @@ function hideLoading() {
     if (loadingEl) loadingEl.classList.add('hidden');
 }
 
-function clampInt(value, defaultValue, minValue = null, maxValue = null) {
-    let n = parseInt(value, 10);
-    if (Number.isNaN(n)) n = defaultValue;
-    if (minValue !== null) n = Math.max(minValue, n);
-    if (maxValue !== null) n = Math.min(maxValue, n);
-    return n;
-}
-
-function getVal(ids, defaultValue = '') {
-    const arr = Array.isArray(ids) ? ids : [ids];
-    for (const id of arr) {
-        const el = $(id);
-        if (el) return el.value;
-    }
-    return defaultValue;
-}
-
-function setVal(ids, value) {
-    const arr = Array.isArray(ids) ? ids : [ids];
-    for (const id of arr) {
-        const el = $(id);
-        if (el) {
-            el.value = value ?? '';
-            return true;
-        }
-    }
-    return false;
-}
-
-function normalizeText(text) {
-    return (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
-
 function safeAddEvent(id, event, handler) {
     const el = $(id);
     if (!el) return;
     el.addEventListener(event, handler);
+}
+
+function downloadText(filename, content) {
+    const blob = new Blob([content || ''], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
 }
 
 function statusText(s) {
@@ -133,31 +150,6 @@ function getConfigNameById(configId) {
     return cfg ? cfg.name : '默认配置';
 }
 
-function maskSecret(secret) {
-    if (!secret) return '';
-    if (secret.length <= 8) return '*'.repeat(secret.length);
-    return secret.slice(0, 4) + '*'.repeat(secret.length - 8) + secret.slice(-4);
-}
-
-function formatTime(ts) {
-    if (!ts) return '-';
-    const d = new Date(ts > 9999999999 ? ts : ts * 1000);
-    if (Number.isNaN(d.getTime())) return '-';
-    return d.toLocaleString();
-}
-
-function downloadText(filename, content) {
-    const blob = new Blob([content || ''], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename || 'download.txt';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-}
-
 // ==================== API ====================
 async function api(url, options = {}) {
     const opts = {
@@ -175,11 +167,11 @@ async function api(url, options = {}) {
     try {
         data = text ? JSON.parse(text) : {};
     } catch (e) {
-        throw new Error(`服务器返回非JSON：${text.slice(0, 200)}`);
+        throw new Error(`服务器返回非JSON：${text.slice(0, 300)}`);
     }
 
     if (!resp.ok && !data.success) {
-        throw new Error(data.error || `请求失败: ${resp.status}`);
+        throw new Error(data.error || `请求失败：${resp.status}`);
     }
 
     return data;
@@ -203,7 +195,7 @@ function showPage(page) {
     setActiveNav(page);
 
     if (page === 'tasks') {
-        loadTasks();
+        loadTasks(false);
         startTaskPolling();
     } else {
         stopTaskPolling();
@@ -237,42 +229,39 @@ function isWeakChapterTitle(line) {
     const s = line.trim().replace(/\u3000/g, ' ').replace(/\s+/g, ' ');
     if (!s || s.length > 60) return false;
 
-    return (
-        /^\d+\s*[、.．\-—]\s*.+$/i.test(s) ||
-        /^\d+\s+.+$/i.test(s)
-    );
+    return /^\d+\s*[、.．\-—]\s*.+$/i.test(s) || /^\d+\s+.+$/i.test(s);
 }
 
 function parseChaptersLocal(content) {
     content = normalizeText(content || '').replace(/\ufeff/g, '');
     const lines = content.split('\n');
 
-    const signals = lines.map(line => {
-        const s = (line || '').trim().replace(/\u3000/g, ' ').replace(/\s+/g, ' ');
+    const items = lines.map(line => {
+        const text = (line || '').trim().replace(/\u3000/g, ' ').replace(/\s+/g, ' ');
         return {
             raw: line,
-            text: s,
-            strong: isStrongChapterTitle(s),
-            weak: isWeakChapterTitle(s)
+            text,
+            strong: isStrongChapterTitle(text),
+            weak: isWeakChapterTitle(text)
         };
     });
 
-    const strongCount = signals.filter(x => x.strong).length;
-    const weakCount = signals.filter(x => x.weak).length;
+    const strongCount = items.filter(x => x.strong).length;
+    const weakCount = items.filter(x => x.weak).length;
 
     function followingTextLength(startIndex, maxLookahead = 8) {
         let total = 0;
-        for (let i = startIndex + 1; i < Math.min(signals.length, startIndex + 1 + maxLookahead); i++) {
-            const s = signals[i].text;
-            if (!s) continue;
-            if (signals[i].strong) break;
-            total += s.length;
+        for (let i = startIndex + 1; i < Math.min(items.length, startIndex + 1 + maxLookahead); i++) {
+            const t = items[i].text;
+            if (!t) continue;
+            if (items[i].strong) break;
+            total += t.length;
         }
         return total;
     }
 
     function isTitleAt(index) {
-        const item = signals[index];
+        const item = items[index];
         if (!item.text) return false;
         if (item.strong) return true;
         if (!item.weak) return false;
@@ -287,25 +276,44 @@ function parseChaptersLocal(content) {
     }
 
     const chapters = [];
-    for (let i = 0; i < signals.length; i++) {
+    for (let i = 0; i < items.length; i++) {
         if (isTitleAt(i)) {
             chapters.push({
                 index: chapters.length + 1,
-                title: signals[i].text
+                title: items[i].text
             });
         }
     }
-
     return chapters;
 }
 
-// ==================== 配置页 ====================
+// ==================== 配置管理 ====================
+function renderConfigOptions() {
+    const selects = [
+        $('chatConfigSelect'),
+        ...document.querySelectorAll('.batch-config-select')
+    ].filter(Boolean);
+
+    selects.forEach(select => {
+        const current = select.value;
+        select.innerHTML =
+            `<option value="">默认配置</option>` +
+            state.configs.map(cfg => `<option value="${cfg.id}">${escapeHtml(cfg.name)}</option>`).join('');
+        select.value = current || '';
+    });
+}
+
 function renderConfigList() {
     const box = $('configList');
     if (!box) return;
 
     if (!state.configs.length) {
-        box.innerHTML = `<div class="empty-state"><div class="icon">⚙️</div><p>暂无自定义配置</p></div>`;
+        box.innerHTML = `
+            <div class="empty-state">
+                <div class="icon">⚙️</div>
+                <p>暂无配置</p>
+            </div>
+        `;
         return;
     }
 
@@ -329,20 +337,6 @@ function renderConfigList() {
     renderConfigOptions();
 }
 
-function renderConfigOptions() {
-    const selects = [
-        $('chatConfigSelect'),
-        ...document.querySelectorAll('.batch-config-select')
-    ].filter(Boolean);
-
-    selects.forEach(select => {
-        const current = select.value;
-        select.innerHTML = `<option value="">默认配置</option>` +
-            state.configs.map(cfg => `<option value="${cfg.id}">${escapeHtml(cfg.name)}</option>`).join('');
-        select.value = current || '';
-    });
-}
-
 async function loadConfigs() {
     try {
         const data = await api('/api/config/list?userId=default');
@@ -363,8 +357,8 @@ function openConfigModal(cfg = null) {
     setVal('cfgContextRounds', cfg?.contextRounds || '');
     setVal('cfgMaxOutputTokens', cfg?.maxOutputTokens || '');
 
-    setVal(['cfgBatchSystemPrompt'], cfg?.batchSystemPrompt || '');
-    setVal(['cfgBatchUserPromptTemplate'], cfg?.batchUserPromptTemplate || '');
+    setVal('cfgBatchSystemPrompt', cfg?.batchSystemPrompt || '');
+    setVal('cfgBatchUserPromptTemplate', cfg?.batchUserPromptTemplate || '');
     setVal('cfgBatchSize', cfg?.batchSize || '');
 
     setVal('cfgApiHost', cfg?.apiHost || '');
@@ -376,13 +370,18 @@ function openConfigModal(cfg = null) {
     setVal('cfgHfToken', '');
     setVal('cfgHfDataset', cfg?.hfDataset || '');
 
-    $('configModalTitle').textContent = cfg ? '编辑配置' : '新建配置';
-    $('btnDeleteConfig').style.display = cfg ? 'inline-flex' : 'none';
-    $('configModal').classList.remove('hidden');
+    setText('configModalTitle', cfg ? '编辑配置' : '新建配置');
+
+    const btnDelete = $('btnDeleteConfig');
+    if (btnDelete) btnDelete.style.display = cfg ? 'inline-flex' : 'none';
+
+    const modal = $('configModal');
+    if (modal) modal.classList.remove('hidden');
 }
 
 function closeConfigModal() {
-    $('configModal').classList.add('hidden');
+    const modal = $('configModal');
+    if (modal) modal.classList.add('hidden');
     state.editingConfigId = null;
 }
 
@@ -394,8 +393,8 @@ async function saveConfig() {
         systemPrompt: getVal('cfgSystemPrompt', ''),
         contextRounds: getVal('cfgContextRounds', ''),
         maxOutputTokens: getVal('cfgMaxOutputTokens', ''),
-        batchSystemPrompt: getVal(['cfgBatchSystemPrompt'], ''),
-        batchUserPromptTemplate: getVal(['cfgBatchUserPromptTemplate'], ''),
+        batchSystemPrompt: getVal('cfgBatchSystemPrompt', ''),
+        batchUserPromptTemplate: getVal('cfgBatchUserPromptTemplate', ''),
         batchSize: getVal('cfgBatchSize', ''),
         apiHost: getVal('cfgApiHost', '').trim(),
         apiKey: getVal('cfgApiKey', '').trim(),
@@ -464,7 +463,188 @@ function editConfig(configId) {
     openConfigModal(cfg);
 }
 
-// ==================== 系统设置 ====================
+// ==================== 聊天 ====================
+async function loadConversations() {
+    try {
+        const data = await api('/api/conversations?userId=default');
+        state.conversations = data.conversations || [];
+        renderConversationList();
+    } catch (e) {
+        console.error('loadConversations error:', e);
+        showToast(`加载对话失败：${e.message || e}`, 'error');
+    }
+}
+
+function renderConversationList() {
+    const box = $('conversationList');
+    if (!box) return;
+
+    if (!state.conversations.length) {
+        box.innerHTML = `
+            <div class="empty-state">
+                <div class="icon">💬</div>
+                <p>暂无对话</p>
+            </div>
+        `;
+        return;
+    }
+
+    box.innerHTML = state.conversations.map(conv => `
+        <div class="task-item" onclick="selectConversation('${conv.id}')" style="cursor:pointer;">
+            <div>
+                <div style="font-weight:600;">${escapeHtml(conv.title || '新对话')}</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    ${conv.lastMessagePreview ? escapeHtml(conv.lastMessagePreview) : '暂无消息'}
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;">
+                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteConversation('${conv.id}')">删除</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+function renderChatMessages(messages = []) {
+    const box = $('chatMessages');
+    if (!box) return;
+
+    if (!messages.length) {
+        box.innerHTML = `
+            <div class="empty-state">
+                <div class="icon">🤖</div>
+                <p>开始一个新的对话吧</p>
+            </div>
+        `;
+        return;
+    }
+
+    box.innerHTML = messages.map(msg => `
+        <div class="chat-message ${msg.role === 'user' ? 'user' : 'assistant'}">
+            <div class="chat-avatar">${msg.role === 'user' ? '你' : 'AI'}</div>
+            <div class="chat-bubble">${escapeHtml(msg.content || '')}</div>
+        </div>
+    `).join('');
+
+    box.scrollTop = box.scrollHeight;
+}
+
+async function createConversation() {
+    try {
+        const configId = getVal('chatConfigSelect', '');
+        const data = await api('/api/conversation/create', {
+            method: 'POST',
+            body: JSON.stringify({
+                userId: 'default',
+                title: '新对话',
+                configId
+            })
+        });
+
+        if (data.success) {
+            state.currentConvId = data.conversation.id;
+            state.currentConvMessages = [];
+            renderChatMessages([]);
+            await loadConversations();
+        } else {
+            showToast(data.error || '创建对话失败', 'error');
+        }
+    } catch (e) {
+        console.error('createConversation error:', e);
+        showToast(`创建对话失败：${e.message || e}`, 'error');
+    }
+}
+
+function selectConversation(convId) {
+    state.currentConvId = convId;
+    state.currentConvMessages = [];
+    renderChatMessages([]);
+}
+
+async function deleteConversation(convId) {
+    if (!confirm('确定删除该对话吗？')) return;
+
+    try {
+        const data = await api('/api/conversation/delete', {
+            method: 'POST',
+            body: JSON.stringify({
+                userId: 'default',
+                id: convId
+            })
+        });
+
+        if (data.success) {
+            if (state.currentConvId === convId) {
+                state.currentConvId = null;
+                state.currentConvMessages = [];
+                renderChatMessages([]);
+            }
+            await loadConversations();
+            showToast('对话已删除', 'success');
+        } else {
+            showToast(data.error || '删除失败', 'error');
+        }
+    } catch (e) {
+        console.error('deleteConversation error:', e);
+        showToast(`删除失败：${e.message || e}`, 'error');
+    }
+}
+
+async function sendChat() {
+    if (state.isSending) return;
+
+    const input = $('chatInput');
+    if (!input) return;
+
+    const message = (input.value || '').trim();
+    if (!message) return;
+
+    if (!state.currentConvId) {
+        await createConversation();
+        if (!state.currentConvId) {
+            showToast('创建对话失败，无法发送消息', 'error');
+            return;
+        }
+    }
+
+    state.currentConvMessages.push({
+        role: 'user',
+        content: message
+    });
+    renderChatMessages(state.currentConvMessages);
+
+    state.isSending = true;
+
+    try {
+        const data = await api('/api/chat', {
+            method: 'POST',
+            body: JSON.stringify({
+                userId: 'default',
+                conversationId: state.currentConvId,
+                configId: getVal('chatConfigSelect', ''),
+                message
+            })
+        });
+
+        if (data.success) {
+            state.currentConvMessages.push({
+                role: 'assistant',
+                content: data.message || ''
+            });
+            renderChatMessages(state.currentConvMessages);
+            input.value = '';
+            await loadConversations();
+        } else {
+            showToast(data.error || '发送失败', 'error');
+        }
+    } catch (e) {
+        console.error('sendChat error:', e);
+        showToast(`发送失败：${e.message || e}`, 'error');
+    } finally {
+        state.isSending = false;
+    }
+}
+
+// ==================== 设置页 ====================
 async function loadSettings() {
     try {
         const data = await api('/api/settings');
@@ -477,49 +657,71 @@ async function loadSettings() {
         state.batchDelayMin = settings.batchDelayMin ?? 15;
         state.batchDelayMax = settings.batchDelayMax ?? 45;
 
-        setVal('settingApiHost', settings.apiHost || '');
-        setVal('settingApiKey', '');
-        setVal('settingModel', settings.model || 'gpt-5.4');
-        setVal('settingTemperature', settings.temperature ?? 0.7);
-        setVal('settingTopP', settings.topP ?? 0.65);
-        setVal('settingContextRounds', settings.contextRounds ?? 100);
-        setVal('settingMaxOutputTokens', settings.maxOutputTokens ?? 1000000);
+        // 默认配置区域
+        setVal('defApiHost', settings.apiHost || '');
+        setVal('defModel', settings.model || 'gpt-5.4');
+        setVal('defTemperature', settings.temperature ?? 0.7);
+        setVal('defTopP', settings.topP ?? 0.65);
+        setVal('defContextRounds', settings.contextRounds ?? 100);
+        setVal('defMaxOutputTokens', settings.maxOutputTokens ?? 1000000);
+        setVal('defSystemPrompt', settings.systemPrompt || '');
+        setVal('defBatchSystemPrompt', settings.batchSystemPrompt || '');
+        setVal('defBatchUserPromptTemplate', settings.batchUserPromptTemplate || '');
 
-        setVal('settingSystemPrompt', settings.systemPrompt || '');
-        setVal('settingBatchSystemPrompt', settings.batchSystemPrompt || '');
-        setVal('settingBatchUserPromptTemplate', settings.batchUserPromptTemplate || '');
-        setVal('settingBatchSize', settings.batchSize ?? 10);
-
-        setVal('settingHfToken', '');
-        setVal('settingHfDataset', settings.hfDataset || '');
-
-        setVal('threadPoolSize', state.threadSettings.threadPoolSize);
+        // 并发/线程
         setVal('maxConcurrent', state.threadSettings.maxConcurrent);
+        setVal('threadPoolSize', state.threadSettings.threadPoolSize);
 
+        // 延迟
+        setVal('batchDelayMin', state.batchDelayMin);
+        setVal('batchDelayMax', state.batchDelayMax);
+
+        // 批处理全局默认值
         setVal('globalBatchSize', state.defaultBatchSize);
         setVal('globalDelayMin', state.batchDelayMin);
         setVal('globalDelayMax', state.batchDelayMax);
+
+        renderServerStatus();
     } catch (e) {
         console.error('loadSettings error:', e);
         showToast(`加载设置失败：${e.message || e}`, 'error');
     }
 }
 
-async function saveSettings() {
+function renderServerStatus() {
+    const serverStatus = $('serverConfigStatus');
+    const threadStatus = $('threadStatus');
+    const delayStatus = $('delayStatus');
+
+    if (serverStatus) {
+        serverStatus.textContent =
+            `默认模型：${state.serverDefaults.model || '-'} | ` +
+            `默认批次：${state.serverDefaults.batchSize || 10} | ` +
+            `默认API Host：${state.serverDefaults.apiHost || '(未配置)'}`;
+    }
+
+    if (threadStatus) {
+        threadStatus.textContent =
+            `线程池：${state.threadSettings.threadPoolSize} | 最大并发：${state.threadSettings.maxConcurrent}`;
+    }
+
+    if (delayStatus) {
+        delayStatus.textContent =
+            `当前延迟：${state.batchDelayMin}-${state.batchDelayMax} 秒`;
+    }
+}
+
+async function saveDefaultSettings() {
     const payload = {
-        apiHost: getVal('settingApiHost', '').trim(),
-        apiKey: getVal('settingApiKey', '').trim(),
-        model: getVal('settingModel', '').trim(),
-        temperature: getVal('settingTemperature', ''),
-        topP: getVal('settingTopP', ''),
-        contextRounds: getVal('settingContextRounds', ''),
-        maxOutputTokens: getVal('settingMaxOutputTokens', ''),
-        systemPrompt: getVal('settingSystemPrompt', ''),
-        batchSystemPrompt: getVal('settingBatchSystemPrompt', ''),
-        batchUserPromptTemplate: getVal('settingBatchUserPromptTemplate', ''),
-        batchSize: getVal('settingBatchSize', ''),
-        hfToken: getVal('settingHfToken', '').trim(),
-        hfDataset: getVal('settingHfDataset', '').trim()
+        apiHost: getVal('defApiHost', '').trim(),
+        model: getVal('defModel', '').trim(),
+        temperature: getVal('defTemperature', ''),
+        topP: getVal('defTopP', ''),
+        contextRounds: getVal('defContextRounds', ''),
+        maxOutputTokens: getVal('defMaxOutputTokens', ''),
+        systemPrompt: getVal('defSystemPrompt', ''),
+        batchSystemPrompt: getVal('defBatchSystemPrompt', ''),
+        batchUserPromptTemplate: getVal('defBatchUserPromptTemplate', '')
     };
 
     try {
@@ -529,14 +731,14 @@ async function saveSettings() {
         });
 
         if (data.success) {
-            showToast('设置保存成功', 'success');
+            showToast('默认设置保存成功', 'success');
             await loadSettings();
         } else {
-            showToast(data.error || '设置保存失败', 'error');
+            showToast(data.error || '保存失败', 'error');
         }
     } catch (e) {
-        console.error('saveSettings error:', e);
-        showToast(`设置保存失败：${e.message || e}`, 'error');
+        console.error('saveDefaultSettings error:', e);
+        showToast(`保存失败：${e.message || e}`, 'error');
     }
 }
 
@@ -556,8 +758,8 @@ async function saveThreadSettings() {
         if (data.success) {
             state.threadSettings.threadPoolSize = data.threadPoolSize || threadPoolSize;
             state.threadSettings.maxConcurrent = data.maxConcurrent || maxConcurrent;
+            renderServerStatus();
             showToast('线程设置已更新', 'success');
-            await loadSettings();
         } else {
             showToast(data.error || '线程设置失败', 'error');
         }
@@ -567,14 +769,54 @@ async function saveThreadSettings() {
     }
 }
 
-// ==================== 批处理上传 ====================
+async function saveDelaySettings() {
+    const delayMin = clampInt(getVal('batchDelayMin', 15), 15, 0, 3600);
+    const delayMax = clampInt(getVal('batchDelayMax', 45), 45, delayMin, 3600);
+
+    state.batchDelayMin = delayMin;
+    state.batchDelayMax = delayMax;
+
+    renderServerStatus();
+    showToast('批次延迟设置已更新（提交任务时生效）', 'success');
+}
+
+// ==================== 批处理页 ====================
 function buildLocalBatchFileFingerprint(fileName, content) {
     return `${fileName}::${(content || '').length}::${(content || '').slice(0, 200)}`;
 }
 
+function renderBatchSubmitArea() {
+    const card = $('batchSubmitArea');
+    if (!card) return;
+
+    if (!state.batchFiles.length) {
+        card.innerHTML = `
+            <div class="empty-state">
+                <p>上传 TXT 后即可提交批处理</p>
+            </div>
+        `;
+        return;
+    }
+
+    card.innerHTML = `
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;">
+            <div style="font-size:13px;color:var(--text-secondary);">
+                当前待提交：<strong>${state.batchFiles.length}</strong> 本
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button id="btnClearBatchInner" class="btn btn-secondary">清空列表</button>
+                <button id="btnSubmitBatchInner" class="btn btn-primary">提交批处理</button>
+            </div>
+        </div>
+    `;
+
+    safeAddEvent('btnClearBatchInner', 'click', clearBatchFiles);
+    safeAddEvent('btnSubmitBatchInner', 'click', submitBatch);
+}
+
 async function handleBatchFiles(files) {
     const txtFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.txt'));
-    if (txtFiles.length === 0) {
+    if (!txtFiles.length) {
         showToast('请选择 .txt 文件', 'warning');
         return;
     }
@@ -595,7 +837,7 @@ async function handleBatchFiles(files) {
                     fileName: file.name,
                     content,
                     previewChapters,
-                    success: content.length > 0
+                    success: !!content
                 });
             };
 
@@ -618,11 +860,10 @@ async function handleBatchFiles(files) {
             continue;
         }
 
-        const totalPreview = result.previewChapters.length || 1;
-        const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const totalChapters = Math.max(1, (result.previewChapters || []).length || 1);
 
         state.batchFiles.push({
-            fileId,
+            fileId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             localFingerprint,
             fileName: result.fileName,
             content: result.content,
@@ -630,7 +871,7 @@ async function handleBatchFiles(files) {
             configId: '',
             batchSize: state.defaultBatchSize || 10,
             startChapter: 1,
-            endChapter: totalPreview
+            endChapter: totalChapters
         });
 
         successCount++;
@@ -638,15 +879,23 @@ async function handleBatchFiles(files) {
 
     hideLoading();
     renderBatchFiles();
+    renderBatchSubmitArea();
 
     let msg = `成功解析 ${successCount}/${txtFiles.length} 个文件`;
     if (duplicateCount > 0) msg += `，跳过重复 ${duplicateCount} 个`;
     showToast(msg, successCount > 0 ? 'success' : 'warning');
 }
 
+function clearBatchFiles() {
+    state.batchFiles = [];
+    renderBatchFiles();
+    renderBatchSubmitArea();
+}
+
 function removeBatchFile(fileId) {
     state.batchFiles = state.batchFiles.filter(f => f.fileId !== fileId);
     renderBatchFiles();
+    renderBatchSubmitArea();
 }
 
 function updateBatchFileField(fileId, field, value) {
@@ -655,12 +904,11 @@ function updateBatchFileField(fileId, field, value) {
 
     item[field] = value;
 
+    const total = Math.max(1, (item.previewChapters || []).length || 1);
+
     if (field === 'batchSize') {
         item.batchSize = clampInt(value, state.defaultBatchSize || 10, 1, 100);
     }
-
-    const total = Math.max(1, (item.previewChapters || []).length || 1);
-
     if (field === 'startChapter' || field === 'endChapter') {
         item.startChapter = clampInt(item.startChapter, 1, 1, total);
         item.endChapter = clampInt(item.endChapter, total, 1, total);
@@ -687,14 +935,8 @@ function renderBatchFiles() {
     }
 
     box.innerHTML = state.batchFiles.map(file => {
-        const previewCount = (file.previewChapters || []).length;
+        const previewCount = (file.previewChapters || []).length || 0;
         const total = Math.max(1, previewCount || 1);
-        const configOptions = `<option value="">默认配置</option>` +
-            state.configs.map(cfg => `
-                <option value="${cfg.id}" ${cfg.id === file.configId ? 'selected' : ''}>
-                    ${escapeHtml(cfg.name)}
-                </option>
-            `).join('');
 
         const previewTitles = (file.previewChapters || []).slice(0, 5).map(ch => ch.title).join(' / ');
 
@@ -704,7 +946,7 @@ function renderBatchFiles() {
                     <div>
                         <div class="batch-file-name">📄 ${escapeHtml(file.fileName)}</div>
                         <div class="batch-file-meta">
-                            预览识别 ${previewCount} 章 | 文件长度 ${(file.content || '').length} 字符
+                            本地预览识别 ${previewCount} 章 | 文件长度 ${(file.content || '').length} 字符
                         </div>
                     </div>
                     <button class="btn btn-sm btn-danger" onclick="removeBatchFile('${file.fileId}')">移除</button>
@@ -720,7 +962,12 @@ function renderBatchFiles() {
                     <label>配置</label>
                     <select class="form-input batch-config-select"
                             onchange="updateBatchFileField('${file.fileId}', 'configId', this.value)">
-                        ${configOptions}
+                        <option value="">默认配置</option>
+                        ${state.configs.map(cfg => `
+                            <option value="${cfg.id}" ${cfg.id === file.configId ? 'selected' : ''}>
+                                ${escapeHtml(cfg.name)}
+                            </option>
+                        `).join('')}
                     </select>
                 </div>
 
@@ -761,7 +1008,7 @@ function renderBatchFiles() {
 }
 
 async function submitBatch() {
-    if (state.batchFiles.length === 0) {
+    if (!state.batchFiles.length) {
         showToast('请先上传文件', 'warning');
         return;
     }
@@ -775,29 +1022,28 @@ async function submitBatch() {
             1,
             100
         );
-        const delayMin = clampInt(
+        const globalDelayMin = clampInt(
             getVal('globalDelayMin', state.batchDelayMin || 15),
             state.batchDelayMin || 15,
             0,
             3600
         );
-        const delayMax = clampInt(
+        const globalDelayMax = clampInt(
             getVal('globalDelayMax', state.batchDelayMax || 45),
             state.batchDelayMax || 45,
-            delayMin,
+            globalDelayMin,
             3600
         );
 
-        const files = state.batchFiles.map(f => {
-            const total = Math.max(1, (f.previewChapters || []).length || 1);
-
+        const files = state.batchFiles.map(file => {
+            const total = Math.max(1, (file.previewChapters || []).length || 1);
             return {
-                fileName: f.fileName || '未命名',
-                content: f.content || '',
-                configId: f.configId || '',
-                batchSize: clampInt(f.batchSize || globalBatchSize, globalBatchSize, 1, 100),
-                startChapter: clampInt(f.startChapter || 1, 1, 1, total),
-                endChapter: clampInt(f.endChapter || total, total, 1, total)
+                fileName: file.fileName,
+                content: file.content || '',
+                configId: file.configId || '',
+                batchSize: clampInt(file.batchSize || globalBatchSize, globalBatchSize, 1, 100),
+                startChapter: clampInt(file.startChapter || 1, 1, 1, total),
+                endChapter: clampInt(file.endChapter || total, total, 1, total)
             };
         });
 
@@ -815,8 +1061,8 @@ async function submitBatch() {
             body: JSON.stringify({
                 userId: 'default',
                 files,
-                delayMin,
-                delayMax
+                delayMin: globalDelayMin,
+                delayMax: globalDelayMax
             })
         });
 
@@ -831,9 +1077,10 @@ async function submitBatch() {
 
             state.batchFiles = [];
             renderBatchFiles();
+            renderBatchSubmitArea();
 
             showPage('tasks');
-            await loadTasks();
+            await loadTasks(false);
         } else {
             showToast(data.error || '提交失败', 'error');
         }
@@ -844,14 +1091,14 @@ async function submitBatch() {
     }
 }
 
-// ==================== 任务列表与详情 ====================
+// ==================== 任务页 ====================
 function startTaskPolling() {
     stopTaskPolling();
-    state.taskPollTimer = setInterval(() => {
+    state.taskPollTimer = setInterval(async () => {
         if (state.currentPage === 'tasks') {
-            loadTasks(false);
+            await loadTasks(false);
             if (state.viewingTaskId) {
-                loadTaskDetail(state.viewingTaskId, false);
+                await loadTaskDetail(state.viewingTaskId, false);
             }
         }
     }, 5000);
@@ -864,14 +1111,14 @@ function stopTaskPolling() {
     }
 }
 
-async function loadTasks(showToastOnError = true) {
+async function loadTasks(showError = true) {
     try {
         const data = await api('/api/tasks');
         state.tasks = data.tasks || [];
         renderTaskList();
     } catch (e) {
         console.error('loadTasks error:', e);
-        if (showToastOnError) {
+        if (showError) {
             showToast(`加载任务失败：${e.message || e}`, 'error');
         }
     }
@@ -903,6 +1150,7 @@ function renderTaskList() {
                     ${escapeHtml(task.message || '')}
                 </div>
             </div>
+
             <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
                 <button class="btn btn-sm btn-secondary" onclick="openTaskDetail('${task.task_id}')">详情</button>
                 <button class="btn btn-sm btn-success" onclick="downloadTask('${task.task_id}')">下载</button>
@@ -913,51 +1161,59 @@ function renderTaskList() {
     `).join('');
 }
 
-function openTaskDetail(taskId) {
-    state.viewingTaskId = taskId;
-    loadTaskDetail(taskId);
+function closeTaskView() {
+    state.viewingTaskId = null;
+    state.viewingTaskData = null;
+    const modal = $('taskViewModal');
+    if (modal) modal.classList.add('hidden');
 }
 
-async function loadTaskDetail(taskId, showToastOnError = true) {
+async function openTaskDetail(taskId) {
+    state.viewingTaskId = taskId;
+    await loadTaskDetail(taskId, true);
+}
+
+async function loadTaskDetail(taskId, showError = true) {
     try {
         const data = await api(`/api/task/${taskId}`);
         if (!data.success) {
-            if (showToastOnError) showToast(data.error || '加载任务详情失败', 'error');
+            if (showError) showToast(data.error || '加载任务详情失败', 'error');
             return;
         }
-        renderTaskDetail(data.task);
+
+        state.viewingTaskData = data.task;
+        renderTaskDetailModal(data.task);
     } catch (e) {
         console.error('loadTaskDetail error:', e);
-        if (showToastOnError) {
+        if (showError) {
             showToast(`加载任务详情失败：${e.message || e}`, 'error');
         }
     }
 }
 
-function renderTaskDetail(task) {
-    const box = $('taskDetail');
-    if (!box) return;
+function renderTaskDetailModal(task) {
+    const modal = $('taskViewModal');
+    const title = $('taskViewTitle');
+    const body = $('taskViewBody');
+    const downloadBtn = $('btnDownloadFromView');
 
-    if (!task) {
-        box.innerHTML = `<div class="empty-state"><p>暂无任务详情</p></div>`;
-        return;
-    }
+    if (!modal || !title || !body) return;
+
+    title.textContent = `任务详情：${(task.task_id || '').slice(0, 8)}`;
 
     const files = task.files || [];
 
-    box.innerHTML = `
+    body.innerHTML = `
         <div class="card">
-            <div class="card-title">
-                <span>任务详情</span>
-                <span style="font-size:12px;color:var(--text-muted);">
-                    ${escapeHtml((task.task_id || '').slice(0, 8))}
-                </span>
-            </div>
+            <div class="card-title">任务概览</div>
             <div style="font-size:13px;color:var(--text-secondary);line-height:1.8;">
                 <div>状态：${statusText(task.status)}</div>
                 <div>进度：${escapeHtml(task.progress || '')}</div>
                 <div>说明：${escapeHtml(task.message || '')}</div>
                 <div>创建时间：${formatTime(task.created_at)}</div>
+                <div>总章节：${task.total_chapters || 0}</div>
+                <div>成功章节：${task.completed_chapters || 0}</div>
+                <div>失败章节：${task.failed_chapters || 0}</div>
             </div>
         </div>
 
@@ -974,8 +1230,8 @@ function renderTaskDetail(task) {
                     <div>配置：${escapeHtml(file.config_name || '默认配置')}</div>
                     <div>状态：${statusText(file.status)}</div>
                     <div>章节范围：第 ${file.start_chapter || '-'} - ${file.end_chapter || '-'} 章</div>
-                    <div>章节进度：成功 ${file.completed_chapters || 0} / 失败 ${file.failed_chapters || 0} / 总计 ${file.total_chapters || 0}</div>
                     <div>批次大小：${file.batch_size || '-'}</div>
+                    <div>章节进度：成功 ${file.completed_chapters || 0} / 失败 ${file.failed_chapters || 0} / 总计 ${file.total_chapters || 0}</div>
                     <div>结果上传：${file.result_uploaded ? '已上传' : (file.result_upload_error ? `失败：${escapeHtml(file.result_upload_error)}` : '未上传')}</div>
                 </div>
 
@@ -1000,7 +1256,7 @@ function renderTaskDetail(task) {
 
                                 ${batch.success ? `
                                     <div style="font-size:13px;line-height:1.7;white-space:pre-wrap;word-break:break-word;">
-                                        ${escapeHtml(batch.preview || batch.result || '')}
+                                        ${escapeHtml(batch.result || batch.preview || '')}
                                     </div>
                                 ` : `
                                     <div style="font-size:13px;color:var(--error);white-space:pre-wrap;">
@@ -1016,6 +1272,12 @@ function renderTaskDetail(task) {
             </div>
         `).join('')}
     `;
+
+    if (downloadBtn) {
+        downloadBtn.onclick = () => downloadTask(task.task_id);
+    }
+
+    modal.classList.remove('hidden');
 }
 
 async function cancelTask(taskId) {
@@ -1030,7 +1292,7 @@ async function cancelTask(taskId) {
 
         if (data.success) {
             showToast('任务已取消', 'success');
-            await loadTasks();
+            await loadTasks(false);
             if (state.viewingTaskId === taskId) {
                 await loadTaskDetail(taskId, false);
             }
@@ -1056,11 +1318,9 @@ async function deleteTask(taskId) {
         if (data.success) {
             showToast('任务已删除', 'success');
             if (state.viewingTaskId === taskId) {
-                state.viewingTaskId = null;
-                const detail = $('taskDetail');
-                if (detail) detail.innerHTML = `<div class="empty-state"><p>请选择任务查看详情</p></div>`;
+                closeTaskView();
             }
-            await loadTasks();
+            await loadTasks(false);
         } else {
             showToast(data.error || '删除失败', 'error');
         }
@@ -1098,11 +1358,11 @@ async function downloadSingleBook(taskId, fileIdx) {
     }
 }
 
-// ==================== HF 云端文件 ====================
+// ==================== 云端文件页 ====================
 async function refreshCloudFiles() {
     try {
-        const hfToken = getVal('settingHfToken', '').trim();
-        const hfDataset = getVal('settingHfDataset', '').trim();
+        const hfToken = getVal('cloudHfToken', '').trim();
+        const hfDataset = getVal('cloudHfDataset', '').trim();
 
         const query = new URLSearchParams({
             hfToken,
@@ -1151,8 +1411,8 @@ function renderCloudFiles() {
 async function downloadCloudFile(encodedPath) {
     try {
         const filename = decodeURIComponent(encodedPath);
-        const hfToken = getVal('settingHfToken', '').trim();
-        const hfDataset = getVal('settingHfDataset', '').trim();
+        const hfToken = getVal('cloudHfToken', '').trim();
+        const hfDataset = getVal('cloudHfDataset', '').trim();
 
         const query = new URLSearchParams({
             hfToken,
@@ -1181,8 +1441,8 @@ async function deleteCloudFile(encodedPath) {
             method: 'POST',
             body: JSON.stringify({
                 action: 'delete',
-                hfToken: getVal('settingHfToken', '').trim(),
-                hfDataset: getVal('settingHfDataset', '').trim(),
+                hfToken: getVal('cloudHfToken', '').trim(),
+                hfDataset: getVal('cloudHfDataset', '').trim(),
                 filename
             })
         });
@@ -1199,190 +1459,7 @@ async function deleteCloudFile(encodedPath) {
     }
 }
 
-// ==================== 聊天 ====================
-async function loadConversations() {
-    try {
-        const data = await api('/api/conversations?userId=default');
-        state.conversations = data.conversations || [];
-        renderConversationList();
-    } catch (e) {
-        console.error('loadConversations error:', e);
-        showToast(`加载对话失败：${e.message || e}`, 'error');
-    }
-}
-
-function renderConversationList() {
-    const box = $('conversationList');
-    if (!box) return;
-
-    if (!state.conversations.length) {
-        box.innerHTML = `
-            <div class="empty-state">
-                <div class="icon">💬</div>
-                <p>暂无对话</p>
-            </div>
-        `;
-        return;
-    }
-
-    box.innerHTML = state.conversations.map(conv => `
-        <div class="task-item" onclick="selectConversation('${conv.id}')" style="cursor:pointer;">
-            <div>
-                <div style="font-weight:600;">${escapeHtml(conv.title || '新对话')}</div>
-                <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
-                    ${conv.lastMessagePreview ? escapeHtml(conv.lastMessagePreview) : '暂无消息'}
-                </div>
-            </div>
-            <div style="display:flex;gap:8px;">
-                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteConversation('${conv.id}')">删除</button>
-            </div>
-        </div>
-    `).join('');
-}
-
-async function createConversation() {
-    try {
-        const configId = getVal('chatConfigSelect', '');
-        const data = await api('/api/conversation/create', {
-            method: 'POST',
-            body: JSON.stringify({
-                userId: 'default',
-                title: '新对话',
-                configId
-            })
-        });
-
-        if (data.success) {
-            state.currentConvId = data.conversation.id;
-            await loadConversations();
-            renderChatMessages(data.conversation);
-        } else {
-            showToast(data.error || '创建对话失败', 'error');
-        }
-    } catch (e) {
-        console.error('createConversation error:', e);
-        showToast(`创建对话失败：${e.message || e}`, 'error');
-    }
-}
-
-async function selectConversation(convId) {
-    state.currentConvId = convId;
-    const conv = state.conversations.find(c => c.id === convId);
-
-    if (!conv) {
-        renderChatMessages({ messages: [] });
-        return;
-    }
-
-    // 列表接口只给摘要，当前先渲染空或已知内容
-    // 如后续需要会话详情接口，可再补
-    renderChatMessages({
-        id: conv.id,
-        title: conv.title,
-        messages: []
-    });
-}
-
-async function deleteConversation(convId) {
-    if (!confirm('确定删除该对话吗？')) return;
-
-    try {
-        const data = await api('/api/conversation/delete', {
-            method: 'POST',
-            body: JSON.stringify({
-                userId: 'default',
-                id: convId
-            })
-        });
-
-        if (data.success) {
-            if (state.currentConvId === convId) {
-                state.currentConvId = null;
-                renderChatMessages({ messages: [] });
-            }
-            await loadConversations();
-            showToast('对话已删除', 'success');
-        } else {
-            showToast(data.error || '删除失败', 'error');
-        }
-    } catch (e) {
-        console.error('deleteConversation error:', e);
-        showToast(`删除失败：${e.message || e}`, 'error');
-    }
-}
-
-function renderChatMessages(conv) {
-    const box = $('chatMessages');
-    if (!box) return;
-
-    const messages = conv?.messages || [];
-    if (!messages.length) {
-        box.innerHTML = `
-            <div class="empty-state">
-                <div class="icon">🤖</div>
-                <p>开始一个新的对话吧</p>
-            </div>
-        `;
-        return;
-    }
-
-    box.innerHTML = messages.map(msg => `
-        <div class="chat-message ${msg.role === 'user' ? 'user' : 'assistant'}">
-            <div class="chat-avatar">${msg.role === 'user' ? '你' : 'AI'}</div>
-            <div class="chat-bubble">${escapeHtml(msg.content || '')}</div>
-        </div>
-    `).join('');
-
-    box.scrollTop = box.scrollHeight;
-}
-
-async function sendChat() {
-    if (state.isSending) return;
-
-    const textarea = $('chatInput');
-    if (!textarea) return;
-
-    const message = textarea.value.trim();
-    if (!message) return;
-
-    if (!state.currentConvId) {
-        await createConversation();
-        if (!state.currentConvId) {
-            showToast('创建对话失败，无法发送消息', 'error');
-            return;
-        }
-    }
-
-    state.isSending = true;
-
-    try {
-        const data = await api('/api/chat', {
-            method: 'POST',
-            body: JSON.stringify({
-                userId: 'default',
-                conversationId: state.currentConvId,
-                configId: getVal('chatConfigSelect', ''),
-                message
-            })
-        });
-
-        if (data.success) {
-            textarea.value = '';
-            showToast('发送成功', 'success');
-            await loadConversations();
-            // 由于后端当前未提供会话详情接口，这里只给出成功提示
-        } else {
-            showToast(data.error || '发送失败', 'error');
-        }
-    } catch (e) {
-        console.error('sendChat error:', e);
-        showToast(`发送失败：${e.message || e}`, 'error');
-    } finally {
-        state.isSending = false;
-    }
-}
-
-// ==================== 初始化 ====================
+// ==================== 初始化绑定 ====================
 function bindNav() {
     document.querySelectorAll('.nav-item').forEach(el => {
         el.addEventListener('click', () => {
@@ -1430,20 +1507,9 @@ function bindBatchUpload() {
 }
 
 function bindActions() {
-    safeAddEvent('btnSaveSettings', 'click', saveSettings);
-    safeAddEvent('btnSaveThreadSettings', 'click', saveThreadSettings);
-
-    safeAddEvent('btnNewConfig', 'click', () => openConfigModal(null));
-    safeAddEvent('btnCloseConfigModal', 'click', closeConfigModal);
-    safeAddEvent('btnCancelConfig', 'click', closeConfigModal);
-    safeAddEvent('btnSaveConfig', 'click', saveConfig);
-
-    safeAddEvent('btnSubmitBatch', 'click', submitBatch);
-    safeAddEvent('btnRefreshTasks', 'click', () => loadTasks());
-    safeAddEvent('btnRefreshCloudFiles', 'click', refreshCloudFiles);
-
-    safeAddEvent('btnNewConversation', 'click', createConversation);
-    safeAddEvent('btnSendChat', 'click', sendChat);
+    // 聊天
+    safeAddEvent('btnNewConv', 'click', createConversation);
+    safeAddEvent('btnSendMessage', 'click', sendChat);
 
     const chatInput = $('chatInput');
     if (chatInput) {
@@ -1455,10 +1521,44 @@ function bindActions() {
         });
     }
 
-    const modal = $('configModal');
-    if (modal) {
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) closeConfigModal();
+    // 配置
+    safeAddEvent('btnNewConfig', 'click', () => openConfigModal(null));
+    safeAddEvent('btnCloseConfigModal', 'click', closeConfigModal);
+    safeAddEvent('btnCancelConfig', 'click', closeConfigModal);
+    safeAddEvent('btnSaveConfig', 'click', saveConfig);
+    safeAddEvent('btnDeleteConfig', 'click', () => {
+        if (state.editingConfigId) deleteConfig(state.editingConfigId);
+    });
+
+    // 设置
+    safeAddEvent('btnSaveDefaults', 'click', saveDefaultSettings);
+    safeAddEvent('btnSaveThreadSettings', 'click', saveThreadSettings);
+    safeAddEvent('btnSaveDelaySettings', 'click', saveDelaySettings);
+
+    // 批处理
+    safeAddEvent('btnSubmitBatch', 'click', submitBatch);
+    safeAddEvent('btnClearBatch', 'click', clearBatchFiles);
+
+    // 任务
+    safeAddEvent('btnRefreshTasks', 'click', () => loadTasks(true));
+    safeAddEvent('btnCloseTaskView', 'click', closeTaskView);
+    safeAddEvent('btnCloseTaskView2', 'click', closeTaskView);
+
+    const taskModal = $('taskViewModal');
+    if (taskModal) {
+        taskModal.addEventListener('click', (e) => {
+            if (e.target === taskModal) closeTaskView();
+        });
+    }
+
+    // 云端
+    safeAddEvent('btnRefreshCloudFiles', 'click', refreshCloudFiles);
+
+    // 配置弹窗背景点击关闭
+    const configModal = $('configModal');
+    if (configModal) {
+        configModal.addEventListener('click', (e) => {
+            if (e.target === configModal) closeConfigModal();
         });
     }
 }
@@ -1477,13 +1577,11 @@ async function initApp() {
         ]);
 
         renderBatchFiles();
+        renderBatchSubmitArea();
         renderTaskList();
         renderConversationList();
-
-        const detail = $('taskDetail');
-        if (detail && !detail.innerHTML.trim()) {
-            detail.innerHTML = `<div class="empty-state"><p>请选择任务查看详情</p></div>`;
-        }
+        renderChatMessages([]);
+        renderCloudFiles();
 
         showPage('chat');
     } catch (e) {
@@ -1495,6 +1593,8 @@ async function initApp() {
 document.addEventListener('DOMContentLoaded', initApp);
 
 // ==================== 导出到 window，供 HTML onclick 使用 ====================
+window.showPage = showPage;
+
 window.openConfigModal = openConfigModal;
 window.closeConfigModal = closeConfigModal;
 window.editConfig = editConfig;
@@ -1503,8 +1603,10 @@ window.deleteConfig = deleteConfig;
 window.removeBatchFile = removeBatchFile;
 window.updateBatchFileField = updateBatchFileField;
 window.submitBatch = submitBatch;
+window.clearBatchFiles = clearBatchFiles;
 
 window.openTaskDetail = openTaskDetail;
+window.closeTaskView = closeTaskView;
 window.cancelTask = cancelTask;
 window.deleteTask = deleteTask;
 window.downloadTask = downloadTask;
