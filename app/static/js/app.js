@@ -1,6 +1,6 @@
 // ============================================
 // AI Workflow Assistant - Frontend
-// Compatible Final Version
+// Final Stable Version
 // ============================================
 
 const $ = (id) => document.getElementById(id);
@@ -38,7 +38,10 @@ function escapeHtml(str) {
 
 function showToast(msg, type = 'info') {
     const c = $('toastContainer');
-    if (!c) return alert(msg);
+    if (!c) {
+        alert(msg);
+        return;
+    }
     const t = document.createElement('div');
     t.className = `toast toast-${type}`;
     t.textContent = msg;
@@ -91,9 +94,10 @@ function setVal(ids, value) {
         const el = $(id);
         if (el) {
             el.value = value ?? '';
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 function getVal(ids, fallback = '') {
@@ -111,7 +115,22 @@ async function api(path, options = {}) {
             headers: { 'Content-Type': 'application/json' },
             ...options
         });
-        return await resp.json();
+
+        const text = await resp.text();
+
+        let data;
+        try {
+            data = text ? JSON.parse(text) : {};
+        } catch (e) {
+            showToast(`服务器返回了非JSON内容（可能后端报错）: ${resp.status}`, 'error');
+            return {
+                success: false,
+                error: `服务器返回非JSON响应: ${resp.status}`,
+                raw: text
+            };
+        }
+
+        return data;
     } catch (e) {
         showToast('网络错误: ' + e.message, 'error');
         return { success: false, error: e.message };
@@ -149,7 +168,6 @@ async function loadServerSettings() {
         state.batchDelayMin = clampInt(state.serverDefaults.batchDelayMin || 15, 15, 0, 3600);
         state.batchDelayMax = clampInt(state.serverDefaults.batchDelayMax || 45, 45, state.batchDelayMin, 3600);
 
-        // 云端输入框默认回填
         if ($('cloudHfDataset') && !$('cloudHfDataset').value) {
             $('cloudHfDataset').value = state.serverDefaults.hfDataset || '';
         }
@@ -333,8 +351,12 @@ function editConfig(configId) {
 
     setVal(['configName', 'cfgName'], cfg.name || '');
     setVal(['configSystemPrompt', 'cfgSystemPrompt'], cfg.systemPrompt || '');
+
+    // ==================== 这里是关键修复 ====================
     setVal(['configBatchSystemPrompt', 'cfgBatchSystemPrompt'], cfg.batchSystemPrompt || '');
     setVal(['configBatchUserPromptTemplate', 'cfgBatchUserPromptTemplate'], cfg.batchUserPromptTemplate || '');
+    // ======================================================
+
     setVal(['configBatchSize', 'cfgBatchSize'], cfg.batchSize || '');
     setVal(['configModel', 'cfgModel'], cfg.model || '');
     setVal(['configTemperature', 'cfgTemperature'], cfg.temperature || '');
@@ -358,8 +380,12 @@ async function saveConfig() {
         id: state.editingConfigId || '',
         name: getVal(['configName', 'cfgName'], '未命名配置'),
         systemPrompt: getVal(['configSystemPrompt', 'cfgSystemPrompt']),
+
+        // ==================== 这里是关键修复 ====================
         batchSystemPrompt: getVal(['configBatchSystemPrompt', 'cfgBatchSystemPrompt']),
         batchUserPromptTemplate: getVal(['configBatchUserPromptTemplate', 'cfgBatchUserPromptTemplate']),
+        // ======================================================
+
         batchSize: getVal(['configBatchSize', 'cfgBatchSize']),
         model: getVal(['configModel', 'cfgModel']),
         temperature: getVal(['configTemperature', 'cfgTemperature']),
@@ -486,7 +512,10 @@ async function createConversation() {
         state.currentConvId = data.conversation.id;
         renderConversationList();
         renderCurrentConversation();
+        return true;
     }
+
+    return false;
 }
 
 async function deleteConversation(convId) {
@@ -510,7 +539,11 @@ async function sendChat() {
     if (!message) return;
 
     if (!state.currentConvId) {
-        await createConversation();
+        const ok = await createConversation();
+        if (!ok || !state.currentConvId) {
+            showToast('创建对话失败，无法发送消息', 'error');
+            return;
+        }
     }
 
     state.isSending = true;
@@ -537,6 +570,7 @@ async function sendChat() {
 }
 
 // ==================== 章节解析（本地） ====================
+
 const SPECIAL_CHAPTER_TITLES = new Set([
     '序章', '序', '楔子', '引子', '前言', '正文',
     '终章', '尾声', '后记', '番外', '番外篇', '完结感言'
@@ -915,7 +949,9 @@ async function submitBatch() {
     }
 }
 
-// ==================== 任务 ====================
+// ==================== 任务 / 云端 / 初始化 ====================
+// 这部分保持和前一版兼容逻辑一致，为节省篇幅不改变主行为
+
 async function refreshTasks() {
     const data = await api('/api/tasks');
     if (data.success) {
@@ -982,7 +1018,6 @@ async function viewTask(taskId) {
     state.viewingTaskId = taskId;
     const task = data.task;
     const { modal, body, title } = getTaskModalElements();
-
     if (!modal || !body) {
         showToast('任务详情弹窗未找到', 'error');
         return;
@@ -1046,7 +1081,6 @@ async function cancelTask(taskId) {
         method: 'POST',
         body: JSON.stringify({ taskId })
     });
-
     if (data.success) {
         showToast('任务已取消', 'success');
         refreshTasks();
@@ -1060,7 +1094,6 @@ async function deleteTask(taskId) {
         method: 'POST',
         body: JSON.stringify({ taskId })
     });
-
     if (data.success) {
         showToast('任务已删除', 'success');
         refreshTasks();
@@ -1099,7 +1132,6 @@ function downloadTextFile(filename, content) {
     URL.revokeObjectURL(url);
 }
 
-// ==================== 云端文件 ====================
 async function refreshCloudFiles() {
     const hfToken = $('cloudHfToken')?.value || '';
     const hfDataset = $('cloudHfDataset')?.value || state.serverDefaults.hfDataset || '';
