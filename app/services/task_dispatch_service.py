@@ -512,32 +512,7 @@ class TaskDispatchService:
 
                 started_at = time.time()
                 messages = self._build_batch_messages(resolved_config, batch_content)
-                batch_system_prompt = (
-                    resolved_config.get("batchSystemPrompt")
-                    or resolved_config.get("systemPrompt")
-                    or ""
-                )
-                batch_user_template = resolved_config.get("batchUserPromptTemplate") or "{content}"
 
-                logger.info(
-                    f"[batch] task={task_id}, file={file_name!r}, batch={batch_index}, "
-                    f"config_id={book_task.get('config_id')!r}, "
-                    f"config_name={book_task.get('config_name')!r}, "
-                    f"apiHost={resolved_config.get('apiHost')!r}, "
-                    f"model={resolved_config.get('model')!r}, "
-                    f"batchSystemPrompt_len={len(batch_system_prompt)}, "
-                    f"batchUserPromptTemplate_len={len(batch_user_template)}, "
-                    f"batch_content_len={len(batch_content or '')}"
-                )
-                logger.info(
-                    "[batch] messages_summary=" + str([
-                        {
-                            "role": m.get("role"),
-                            "len": len(m.get("content") or "")
-                        }
-                        for m in messages
-                    ])
-                )
                 call_result = llm_service.call_with_retry(
                     config=resolved_config,
                     messages=messages,
@@ -576,7 +551,6 @@ class TaskDispatchService:
                 self._append_batch_result(task_id, file_idx, batch_result)
                 self._update_task_aggregate_progress(task_id)
 
-            # 单书处理结束
             current_task = task_store.get_task_ref(task_id)
             if not current_task or current_task.get("status") == "cancelled":
                 self._mark_book_terminal(task_id, file_idx, "cancelled", "任务已取消")
@@ -584,26 +558,42 @@ class TaskDispatchService:
                 self._update_task_status_if_finished(task_id)
                 return
 
-            # 上传结果
+            # 上传结果前，重新获取最新任务引用，避免使用旧快照导致 batches 为空
+            current_task_ref = task_store.get_task_ref(task_id)
+            if not current_task_ref:
+                raise RuntimeError("任务在上传结果前不存在")
+
+            current_files = current_task_ref.get("files", [])
+            if not (0 <= file_idx < len(current_files)):
+                raise RuntimeError("上传结果时文件索引无效")
+
+            current_book_task = current_files[file_idx]
+
             upload_result = result_service.upload_single_book_result(
                 task_id=task_id,
-                book_task=book_task,
-                default_config=task.get("default_config", {})
+                book_task=current_book_task,
+                default_config=current_task_ref.get("default_config", {})
             )
 
             if upload_result.get("success"):
-                book_task["result_uploaded"] = True
-                book_task["result_upload_error"] = ""
+                current_book_task["result_uploaded"] = True
+                current_book_task["result_upload_error"] = ""
                 uploaded_name = upload_result.get("filename")
                 if uploaded_name:
-                    task.setdefault("result_files", [])
-                    if uploaded_name not in task["result_files"]:
-                        task["result_files"].append(uploaded_name)
+                    current_task_ref.setdefault("result_files", [])
+                    if uploaded_name not in current_task_ref["result_files"]:
+                        current_task_ref["result_files"].append(uploaded_name)
             else:
-                book_task["result_uploaded"] = False
-                book_task["result_upload_error"] = upload_result.get("error", "")
+                current_book_task["result_uploaded"] = False
+                current_book_task["result_upload_error"] = upload_result.get("error", "")
 
-            failed = book_task.get("failed_chapters", 0)
+            # 清理大字段，避免任务完成后长期占用内存
+            current_book_task["raw_content"] = ""
+            current_book_task["all_chapters"] = []
+            current_book_task["selected_chapters"] = []
+            current_book_task["batches_plan"] = []
+
+            failed = current_book_task.get("failed_chapters", 0)
             final_status = "completed" if failed == 0 else "partial_failed"
             self._mark_book_terminal(task_id, file_idx, final_status, "处理完成")
             self.set_fingerprint_status(fingerprint, final_status)
