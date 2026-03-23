@@ -32,29 +32,71 @@ executor = ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE)
 _http_session = http_requests.Session()
 
 
+# ==================== 通用工具 ====================
+
+def _safe_int(value, default, min_value=None, max_value=None):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+
+    if min_value is not None:
+        result = max(min_value, result)
+    if max_value is not None:
+        result = min(max_value, result)
+    return result
+
+
+def _safe_float(value, default, min_value=None, max_value=None):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = default
+
+    if min_value is not None:
+        result = max(min_value, result)
+    if max_value is not None:
+        result = min(max_value, result)
+    return result
+
+
+def _get_available_slots():
+    return getattr(task_semaphore, "_value", 0)
+
+
+def _extract_assistant_content(result: dict) -> str:
+    try:
+        return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        return ""
+
+
 # ==================== LLM 调用 ====================
 
 def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
     """
     调用LLM API
-    
+
     Args:
         config: 配置字典
         messages: 消息列表
         use_stream: 是否使用流式响应
-    
+
     Returns:
         (success, result) - 成功时result是响应JSON，失败时result是错误信息
     """
-    api_host = config.get("apiHost", "").rstrip("/")
+    api_host = (config.get("apiHost", "") or "").rstrip("/")
     api_key = config.get("apiKey", "")
     model = config.get("model", "gpt-5.4")
-    temperature = float(config.get("temperature", 0.7))
-    top_p = float(config.get("topP", 0.65))
+    temperature = _safe_float(config.get("temperature", 0.7), 0.7)
+    top_p = _safe_float(config.get("topP", 0.65), 0.65)
     # max_tokens设置为1M (1000000)，除非用户明确指定较小值
-    max_tokens = int(config.get("maxOutputTokens", 1000000))
+    max_tokens = _safe_int(config.get("maxOutputTokens", 1000000), 1000000, min_value=1)
     if max_tokens <= 0:
         max_tokens = 1000000
+
+    if not api_host:
+        return False, "未配置 apiHost"
 
     url = f"{api_host}/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -72,19 +114,19 @@ def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
 
     # 批处理使用更长的超时时间（30分钟），聊天使用较短超时（10分钟）
     timeout = 1800 if use_stream else 600
-    
+
     try:
         if use_stream:
             # 流式响应处理
             resp = _http_session.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
             if resp.status_code != 200:
                 return False, f"API错误: {resp.status_code} - {resp.text[:200]}"
-            
+
             # 收集流式响应
             full_content = ""
             for line in resp.iter_lines():
                 if line:
-                    line = line.decode('utf-8')
+                    line = line.decode('utf-8', errors='ignore')
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
@@ -95,7 +137,7 @@ def _call_llm_api(config: dict, messages: list, use_stream: bool = False):
                                 full_content += chunk["choices"][0]["delta"]["content"]
                         except json.JSONDecodeError:
                             continue
-            
+
             return True, {"choices": [{"message": {"content": full_content}}]}
         else:
             # 非流式响应（聊天功能使用）
@@ -122,40 +164,187 @@ def _build_messages(system_prompt: str, history: list, user_message: str, contex
 
 # ==================== 章节解析 ====================
 
+_CHAPTER_SPECIAL_TITLES = {
+    "序章", "序", "楔子", "引子", "前言", "正文",
+    "终章", "尾声", "后记", "番外", "番外篇", "完结感言"
+}
+
+_STRONG_CHAPTER_PATTERNS = [
+    # 第15章 / 第 15 章 / 第十五章 / 第 十五 章 / 第十五章：归来 / 第十五卷
+    r'^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s*(?:[：:·\-—.．、]\s*.*)?$',
+    r'^第\s*[零一二三四五六七八九十百千万两〇\d]+\s*[章节回卷集部篇册]\s+.*$',
+
+    # chapter 15 / CHAPTER 15 / chapter iv
+    r'^chapter\s*\d+\s*(?:[:：.\-—]\s*.*)?$',
+    r'^chapter\s*[ivxlcdm]+\s*(?:[:：.\-—]\s*.*)?$',
+]
+
+_WEAK_CHAPTER_PATTERNS = [
+    # 1、这一天 / 1. 这一天 / 1-这一天 / 1 — 这一天
+    r'^\d+\s*[、.．\-—]\s*.+$',
+    # 1 这一天 / 001 重生
+    r'^\d+\s+.+$',
+]
+
+
+def _normalize_chapter_line(line: str) -> str:
+    if line is None:
+        return ""
+    line = line.replace("\ufeff", "").replace("\u3000", " ")
+    line = line.strip()
+    line = re.sub(r"\s+", " ", line)
+    return line
+
+
+def _is_special_chapter_title(line: str) -> bool:
+    normalized = _normalize_chapter_line(line)
+    return normalized in _CHAPTER_SPECIAL_TITLES
+
+
+def _is_strong_chapter_title(line: str) -> bool:
+    normalized = _normalize_chapter_line(line)
+    if not normalized:
+        return False
+
+    if _is_special_chapter_title(normalized):
+        return True
+
+    if len(normalized) > 80:
+        return False
+
+    for pattern in _STRONG_CHAPTER_PATTERNS:
+        if re.match(pattern, normalized, re.IGNORECASE):
+            return True
+    return False
+
+
+def _is_weak_chapter_title(line: str) -> bool:
+    normalized = _normalize_chapter_line(line)
+    if not normalized:
+        return False
+
+    if len(normalized) > 60:
+        return False
+
+    for pattern in _WEAK_CHAPTER_PATTERNS:
+        if re.match(pattern, normalized, re.IGNORECASE):
+            return True
+    return False
+
+
+def _collect_following_text_length(lines: list, start_index: int, max_lookahead: int = 8) -> int:
+    """
+    从 start_index 之后向下看几行，统计像正文的总长度
+    用于辅助判断弱标题是否可信
+    """
+    total_len = 0
+    for i in range(start_index + 1, min(len(lines), start_index + 1 + max_lookahead)):
+        text = _normalize_chapter_line(lines[i])
+        if not text:
+            continue
+        if _is_strong_chapter_title(text):
+            break
+        total_len += len(text)
+    return total_len
+
+
+def _count_chapter_signal_lines(lines: list):
+    strong_count = 0
+    weak_count = 0
+    for line in lines:
+        normalized = _normalize_chapter_line(line)
+        if not normalized:
+            continue
+        if _is_strong_chapter_title(normalized):
+            strong_count += 1
+        elif _is_weak_chapter_title(normalized):
+            weak_count += 1
+    return strong_count, weak_count
+
+
+def _is_chapter_title_with_context(lines: list, index: int, strong_count: int, weak_count: int) -> bool:
+    """
+    带上下文的章节判断：
+    - 强标题：直接认
+    - 弱标题：尽量匹配，但增加少量上下文判断，避免太离谱的误判
+    """
+    raw_line = lines[index]
+    normalized = _normalize_chapter_line(raw_line)
+    if not normalized:
+        return False
+
+    if _is_strong_chapter_title(normalized):
+        return True
+
+    if not _is_weak_chapter_title(normalized):
+        return False
+
+    # 尽可能匹配：只做轻度约束，不做过强拦截
+    # 1) 如果全文完全是弱章节模式小说，就允许匹配
+    # 2) 如果全文同时有强章节模式，也仍允许弱标题出现（有些小说混用）
+    # 3) 但如果后面几乎没有正文，也不像章节
+    following_len = _collect_following_text_length(lines, index, max_lookahead=8)
+    if following_len >= 12:
+        return True
+
+    # 如果弱章节信号很多，也接受
+    if weak_count >= 3:
+        return True
+
+    # 如果这一行形式非常典型，也接受
+    if re.match(r'^\d+\s*[、.．\-—]\s*.+$', normalized, re.IGNORECASE):
+        return True
+
+    # 最后的兜底：纯数字+空格标题，如果全文至少有一本像小说章节的结构，也接受
+    if strong_count + weak_count >= 2 and re.match(r'^\d+\s+.+$', normalized, re.IGNORECASE):
+        return True
+
+    return False
+
+
 def _parse_chapters(content: str) -> list:
+    if not content:
+        return []
+
+    lines = content.splitlines()
+    strong_count, weak_count = _count_chapter_signal_lines(lines)
+
     chapters = []
-    patterns = [
-        r'^[第]\s*([零一二三四五六七八九十百千万\d]+)\s*[章节回卷集部篇]\s*[：:．.\s]*\S+',
-        r'^Chapter\s*\d+.*',
-        r'^CHAPTER\s*\d+.*',
-        r'^\d+[、.．]\s*\S+',
-    ]
-    combined = '|'.join(f'({p})' for p in patterns)
-    lines = content.split('\n')
     current_chapter = None
     current_lines = []
 
-    for line in lines:
-        stripped = line.strip()
+    for idx, raw_line in enumerate(lines):
+        stripped = _normalize_chapter_line(raw_line)
+
         if not stripped:
             if current_chapter is not None:
-                current_lines.append(line)
+                current_lines.append(raw_line)
             continue
-        if re.match(combined, stripped, re.IGNORECASE):
+
+        if _is_chapter_title_with_context(lines, idx, strong_count, weak_count):
             if current_chapter is not None:
                 chapter_text = '\n'.join(current_lines).strip()
                 if chapter_text:
-                    chapters.append({'title': current_chapter, 'content': chapter_text, 'index': len(chapters) + 1})
+                    chapters.append({
+                        'title': current_chapter,
+                        'content': chapter_text,
+                        'index': len(chapters) + 1
+                    })
             current_chapter = stripped
             current_lines = []
         else:
             if current_chapter is not None:
-                current_lines.append(line)
+                current_lines.append(raw_line)
 
     if current_chapter is not None:
         chapter_text = '\n'.join(current_lines).strip()
         if chapter_text:
-            chapters.append({'title': current_chapter, 'content': chapter_text, 'index': len(chapters) + 1})
+            chapters.append({
+                'title': current_chapter,
+                'content': chapter_text,
+                'index': len(chapters) + 1
+            })
+
     return chapters
 
 
@@ -169,13 +358,13 @@ LLM_RETRY_DELAY = 5  # 秒
 def _call_llm_api_with_retry(config: dict, messages: list, max_retries: int = LLM_MAX_RETRIES, use_stream: bool = True):
     """
     带重试机制的 LLM API 调用
-    
+
     Args:
         config: 配置字典
         messages: 消息列表
         max_retries: 最大重试次数
         use_stream: 是否使用流式响应（批处理默认使用流式）
-    
+
     Returns:
         (success, result) - 成功时result是响应JSON，失败时result是错误信息
     """
@@ -211,7 +400,7 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
 
         # 获取章节列表（深拷贝，避免共享引用问题）
         chapters = list(file_info.get("chapters", []))
-        batch_size = max(1, int(file_info.get("batch_size", DEFAULT_BATCH_SIZE)))
+        batch_size = max(1, _safe_int(file_info.get("batch_size", DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1))
         file_name = file_info.get("file_name", "未命名")
 
         # 获取提示词配置
@@ -219,8 +408,8 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
         user_prompt_template = config.get("batchUserPromptTemplate", "")
 
         # 确保延迟范围有效
-        delay_min = max(0, int(delay_min))
-        delay_max = max(delay_min, int(delay_max))
+        delay_min = max(0, _safe_int(delay_min, 15, min_value=0))
+        delay_max = max(delay_min, _safe_int(delay_max, 45, min_value=0))
 
         # 上下文历史
         context_messages = []
@@ -253,7 +442,9 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
             # 构建当前批次的章节内容
             batch_content_parts = []
             for ch in batch_chapters:
-                batch_content_parts.append(f"\n\n=== {ch['title']} ===\n\n{ch['content']}")
+                title = ch.get("title", "未命名章节")
+                content = ch.get("content", "")
+                batch_content_parts.append(f"\n\n=== {title} ===\n\n{content}")
             batch_content = "".join(batch_content_parts)
 
             # 构建用户消息
@@ -279,7 +470,7 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
             success, result = _call_llm_api_with_retry(config, messages)
 
             if success:
-                assistant_message = result['choices'][0]['message']['content']
+                assistant_message = _extract_assistant_content(result)
 
                 # 保存上下文
                 context_messages.append({"role": "user", "content": user_message})
@@ -292,7 +483,7 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
                     "chapter_start": batch_start + 1,
                     "chapter_end": batch_end,
                     "chapter_count": len(batch_chapters),
-                    "chapter_titles": [ch["title"] for ch in batch_chapters],
+                    "chapter_titles": [ch.get("title", "未命名章节") for ch in batch_chapters],
                     "success": True,
                     "result": assistant_message,
                     "preview": assistant_message[:300] + ("..." if len(assistant_message) > 300 else ""),
@@ -312,7 +503,7 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
                     })
 
                 logger.info(f"[线程{file_idx}] [{file_name}] 批次 {batch_num}/{total_batches} 处理成功")
-                
+
                 # 批次间随机延迟（最后一个批次不延迟）
                 if batch_index < total_batches - 1 and delay_max > 0:
                     delay = random.randint(delay_min, delay_max)
@@ -327,7 +518,7 @@ def process_single_novel(task_id: str, file_idx: int, file_info: dict, config: d
                     "chapter_start": batch_start + 1,
                     "chapter_end": batch_end,
                     "chapter_count": len(batch_chapters),
-                    "chapter_titles": [ch["title"] for ch in batch_chapters],
+                    "chapter_titles": [ch.get("title", "未命名章节") for ch in batch_chapters],
                     "success": False,
                     "error": str(result),
                     "preview": "",
@@ -361,11 +552,11 @@ def _run_batch_task(task_id: str, resume: bool = False, delay_min: int = None, d
             return
 
         files = task.get("files", [])
-        
+
         # 使用传入的延迟配置，如果没有则使用默认值
         actual_delay_min = delay_min if delay_min is not None else BATCH_DELAY_MIN
         actual_delay_max = delay_max if delay_max is not None else BATCH_DELAY_MAX
-        
+
         if not resume:
             # 新任务：初始化计数
             total_chapters = sum(f.get("total", 0) for f in files)
@@ -395,7 +586,7 @@ def _run_batch_task(task_id: str, resume: bool = False, delay_min: int = None, d
 
             # 获取预解析的配置
             config = file_info.get("resolved_config", {})
-            
+
             # 计算该文件的起始批次（恢复模式）
             start_batch = 0
             if resume:
@@ -405,17 +596,18 @@ def _run_batch_task(task_id: str, resume: bool = False, delay_min: int = None, d
                 for r in results:
                     if r.get("success"):
                         processed_batches.add(r.get("batch", 0))
-                
+
                 # 找到第一个未成功处理的批次
-                total_batches = (file_info.get("total", 0) + file_info.get("batch_size", DEFAULT_BATCH_SIZE) - 1) // max(1, file_info.get("batch_size", DEFAULT_BATCH_SIZE))
+                file_batch_size = max(1, _safe_int(file_info.get("batch_size", DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1))
+                total_batches = (file_info.get("total", 0) + file_batch_size - 1) // file_batch_size
                 for b in range(1, total_batches + 1):
                     if b not in processed_batches:
                         start_batch = b - 1  # 转换为0-based索引
                         break
-                
+
                 if start_batch > 0:
                     logger.info(f"[恢复] 文件 {file_info.get('file_name')} 从批次 {start_batch + 1} 继续")
-            
+
             # 创建线程 - 每个线程独立处理一本小说文档
             thread = threading.Thread(
                 target=process_single_novel,
@@ -425,22 +617,43 @@ def _run_batch_task(task_id: str, resume: bool = False, delay_min: int = None, d
             threads.append(thread)
             thread.start()
             logger.info(f"启动线程 {file_idx} 处理小说: {file_info.get('file_name', 'unknown')}")
-        
+
         # 等待所有线程完成
         for thread in threads:
             thread.join()
 
         # 每本小说处理完后立即上传结果到 HF 数据集
         task = task_store.get_task(task_id)
+        if not task:
+            return
+
         for file_idx, file_info in enumerate(task.get("files", [])):
             _upload_single_novel_result(task_id, file_idx, file_info)
 
-        # 完成
+        # 完成状态判定
         task = task_store.get_task(task_id)
+        if not task:
+            return
+
+        completed = task.get("completed_chapters", 0)
+        failed = task.get("failed_chapters", 0)
+        total = task.get("total_chapters", 0)
+
+        if task.get("status") == "cancelled":
+            return
+
+        final_status = "completed" if failed == 0 else "partial_failed"
+        final_progress = "完成" if failed == 0 else f"{completed}/{total}"
+        final_message = (
+            f"批处理完成: {completed}/{total}"
+            if failed == 0
+            else f"批处理完成，但存在失败章节: 成功 {completed}/{total}，失败 {failed}"
+        )
+
         task_store.update_task(task_id, {
-            "status": "completed",
-            "progress": "完成",
-            "message": f"批处理完成: {task.get('completed_chapters', 0)}/{task.get('total_chapters', 0)}"
+            "status": final_status,
+            "progress": final_progress,
+            "message": final_message
         })
 
     except Exception as e:
@@ -537,7 +750,7 @@ def register_routes(app):
             'batch_size': DEFAULT_BATCH_SIZE,
             'batch_delay_min': BATCH_DELAY_MIN,
             'batch_delay_max': BATCH_DELAY_MAX,
-            'available_slots': task_semaphore._value
+            'available_slots': _get_available_slots()
         })
 
     # ==================== 设置 ====================
@@ -564,7 +777,7 @@ def register_routes(app):
     def set_concurrent():
         global MAX_CONCURRENT_TASKS, task_semaphore
         data = request.json or {}
-        value = max(1, min(50, int(data.get('maxConcurrent', 10))))
+        value = _safe_int(data.get('maxConcurrent', 10), 10, min_value=1, max_value=50)
         MAX_CONCURRENT_TASKS = value
         task_semaphore = threading.Semaphore(value)
         logger.info(f"并发数调整为: {value}")
@@ -575,7 +788,7 @@ def register_routes(app):
         """设置线程池大小"""
         global DEFAULT_THREAD_POOL_SIZE, executor
         data = request.json or {}
-        value = max(1, min(100, int(data.get('threadPoolSize', 10))))
+        value = _safe_int(data.get('threadPoolSize', 10), 10, min_value=1, max_value=100)
         DEFAULT_THREAD_POOL_SIZE = value
         # 重新创建线程池
         executor = ThreadPoolExecutor(max_workers=value)
@@ -587,14 +800,14 @@ def register_routes(app):
         """设置批次间延迟范围（秒）"""
         global BATCH_DELAY_MIN, BATCH_DELAY_MAX
         data = request.json or {}
-        min_val = max(0, int(data.get('delayMin', BATCH_DELAY_MIN)))
-        max_val = max(min_val, int(data.get('delayMax', BATCH_DELAY_MAX)))
+        min_val = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
+        max_val = _safe_int(data.get('delayMax', BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=min_val)
         BATCH_DELAY_MIN = min_val
         BATCH_DELAY_MAX = max_val
         logger.info(f"批次延迟调整为: {min_val}-{max_val} 秒")
         return jsonify({
-            'success': True, 
-            'batchDelayMin': BATCH_DELAY_MIN, 
+            'success': True,
+            'batchDelayMin': BATCH_DELAY_MIN,
             'batchDelayMax': BATCH_DELAY_MAX
         })
 
@@ -607,7 +820,7 @@ def register_routes(app):
             'batchSize': DEFAULT_BATCH_SIZE,
             'batchDelayMin': BATCH_DELAY_MIN,
             'batchDelayMax': BATCH_DELAY_MAX,
-            'availableSlots': task_semaphore._value,
+            'availableSlots': _get_available_slots(),
             'taskCount': task_store.task_count()
         })
 
@@ -707,7 +920,7 @@ def register_routes(app):
         config = app_settings_service.resolve_config_from_id(user_id, config_id)
         # 聊天功能使用 systemPrompt
         system_prompt = config.get('systemPrompt', '')
-        context_rounds = int(config.get('contextRounds', 100))
+        context_rounds = _safe_int(config.get('contextRounds', 100), 100, min_value=0)
 
         # 添加用户消息
         user_msg = {'role': 'user', 'content': user_message, 'time': int(time.time() * 1000)}
@@ -721,7 +934,7 @@ def register_routes(app):
         success, result = _call_llm_api(config, messages)
 
         if success:
-            assistant_message = result['choices'][0]['message']['content']
+            assistant_message = _extract_assistant_content(result)
             assistant_msg = {'role': 'assistant', 'content': assistant_message, 'time': int(time.time() * 1000)}
             conversation_store.add_message(user_id, conv_id, assistant_msg)
             return jsonify({'success': True, 'message': assistant_message})
@@ -749,10 +962,10 @@ def register_routes(app):
         data = request.json or {}
         user_id = data.get('userId', 'default')
         files = data.get('files', [])
-        batch_size = int(data.get('batchSize', DEFAULT_BATCH_SIZE))
+        batch_size = _safe_int(data.get('batchSize', DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE, min_value=1)
         # 获取延迟配置
-        delay_min = int(data.get('delayMin', BATCH_DELAY_MIN))
-        delay_max = int(data.get('delayMax', BATCH_DELAY_MAX))
+        delay_min = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
+        delay_max = _safe_int(data.get('delayMax', BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=delay_min)
 
         if not files:
             return jsonify({'success': False, 'error': '没有文件可处理'}), 400
@@ -768,14 +981,14 @@ def register_routes(app):
             chapters = f.get('chapters', [])
             config_id = f.get('configId', '')
             config_name = f.get('configName', '默认配置')
-            file_batch_size = int(f.get('batchSize', batch_size))
+            file_batch_size = _safe_int(f.get('batchSize', batch_size), batch_size, min_value=1)
 
             # 在请求上下文中解析配置（关键：避免后台线程中的应用上下文问题）
             resolved_config = app_settings_service.resolve_config_from_id(user_id, config_id)
-            
+
             # 如果配置中有批次大小，使用配置中的
             if resolved_config.get('batchSize'):
-                file_batch_size = int(resolved_config['batchSize'])
+                file_batch_size = _safe_int(resolved_config['batchSize'], file_batch_size, min_value=1)
 
             # 获取配置名（如果提供了 configId）
             if config_id and config_id != "__default__":
@@ -813,7 +1026,7 @@ def register_routes(app):
             'default_config': default_config,
         }
         task_store.create_task(task_id, task_data)
-        
+
         # 启动批处理任务
         thread = threading.Thread(target=_run_batch_task, args=(task_id, False, delay_min, delay_max))
         thread.daemon = True
@@ -837,24 +1050,24 @@ def register_routes(app):
         task_id = data.get('taskId')
         if not task_id:
             return jsonify({'success': False, 'error': '缺少taskId'}), 400
-        
+
         task = task_store.get_task(task_id)
         if not task:
             return jsonify({'success': False, 'error': '任务不存在'}), 404
-        
-        # 只有已取消或失败的任务可以恢复
-        if task.get('status') not in ('cancelled', 'failed', 'completed'):
-            return jsonify({'success': False, 'error': '只有已取消、失败或完成的任务可以恢复'}), 400
-        
+
+        # 只有已取消、失败、部分失败的任务可以恢复
+        if task.get('status') not in ('cancelled', 'failed', 'partial_failed'):
+            return jsonify({'success': False, 'error': '只有已取消、失败或部分失败的任务可以恢复'}), 400
+
         # 获取延迟配置
-        delay_min = int(data.get('delayMin', BATCH_DELAY_MIN))
-        delay_max = int(data.get('delayMax', BATCH_DELAY_MAX))
-        
+        delay_min = _safe_int(data.get('delayMin', BATCH_DELAY_MIN), BATCH_DELAY_MIN, min_value=0)
+        delay_max = _safe_int(data.get('delayMax', BATCH_DELAY_MAX), BATCH_DELAY_MAX, min_value=delay_min)
+
         # 启动恢复任务
         thread = threading.Thread(target=_run_batch_task, args=(task_id, True, delay_min, delay_max))
         thread.daemon = True
         thread.start()
-        
+
         logger.info(f"任务 {task_id} 从失败处恢复运行")
         return jsonify({'success': True, 'message': '任务已恢复运行'})
 
