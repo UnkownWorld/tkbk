@@ -891,72 +891,96 @@ function updateBatchFileEndChapter(fileId, endChapter) {
     renderBatchFiles();
 }
 
-async function submitBatch() {
+
+ async function submitBatch() {
     if (state.batchFiles.length === 0) return;
 
     showLoading('正在提交批处理任务...');
 
-    const globalBatchSize = clampInt(getVal(['globalBatchSize'], state.defaultBatchSize), state.defaultBatchSize, 1, 100);
-    const delayMin = clampInt(getVal(['globalDelayMin'], state.batchDelayMin), state.batchDelayMin, 0, 3600);
-    const delayMax = clampInt(getVal(['globalDelayMax'], state.batchDelayMax), state.batchDelayMax, delayMin, 3600);
-
-    const files = state.batchFiles.map(f => ({
-        fileName: f.fileName,
-        chapters: f.chapters,
-        configId: f.configId || '',
-        configName: getConfigNameById(f.configId || ''),
-        batchSize: clampInt(f.batchSize || globalBatchSize, globalBatchSize, 1, 100),
-        startChapter: clampInt(f.startChapter || 1, 1, 1, Math.max(1, f.chapters.length)),
-        endChapter: clampInt(f.endChapter || f.chapters.length, f.chapters.length, 1, Math.max(1, f.chapters.length))
-    }));
-
-    console.log('[提交批处理 payload]', files.map(f => ({
-        fileName: f.fileName,
-        configId: f.configId,
-        configName: f.configName,
-        batchSize: f.batchSize,
-        startChapter: f.startChapter,
-        endChapter: f.endChapter,
-        chapterCount: f.chapters.length
-    })));
-
-    const data = await api('/api/batch', {
-        method: 'POST',
-        body: JSON.stringify({
-            userId: 'default',
-            files,
-            batchSize: globalBatchSize,
+    try {
+        const globalBatchSize = clampInt(
+            getVal(['globalBatchSize'], state.defaultBatchSize),
+            state.defaultBatchSize,
+            1,
+            100
+        );
+        const delayMin = clampInt(
+            getVal(['globalDelayMin'], state.batchDelayMin),
+            state.batchDelayMin,
+            0,
+            3600
+        );
+        const delayMax = clampInt(
+            getVal(['globalDelayMax'], state.batchDelayMax),
+            state.batchDelayMax,
             delayMin,
-            delayMax
-        }),
-    });
+            3600
+        );
 
-    hideLoading();
+        const files = state.batchFiles.map(f => {
+            const chapters = Array.isArray(f.chapters) ? f.chapters : [];
+            const total = Math.max(1, chapters.length);
 
-    if (data.success) {
-        let msg = `任务已提交：${data.totalChapters} 个章节`;
-        if (data.queuedFiles !== undefined) msg += `，入队 ${data.queuedFiles} 本`;
-        if (data.duplicateFiles && data.duplicateFiles.length > 0) msg += `，重复跳过 ${data.duplicateFiles.length} 本`;
-        showToast(msg, 'success');
+            return {
+                fileName: f.fileName || f.name || '未命名',
+                content: f.content || '',          // 关键：把原始全文带给后端
+                rawContent: f.content || '',       // 双保险兼容后端
+                chapters: chapters,
+                configId: f.configId || '',
+                configName: getConfigNameById(f.configId || ''),
+                batchSize: clampInt(f.batchSize || globalBatchSize, globalBatchSize, 1, 100),
+                startChapter: clampInt(f.startChapter || 1, 1, 1, total),
+                endChapter: clampInt(f.endChapter || chapters.length || 1, chapters.length || 1, 1, total)
+            };
+        });
 
-        if (data.duplicateFiles && data.duplicateFiles.length > 0) {
-            const duplicateNames = data.duplicateFiles.map(x => x.fileName).join('、');
-            showToast(`以下文件已在队列或处理中，已跳过：${duplicateNames}`, 'warning');
-        }
+        console.log('[提交批处理 payload]', files.map(f => ({
+            fileName: f.fileName,
+            configId: f.configId,
+            configName: f.configName,
+            batchSize: f.batchSize,
+            startChapter: f.startChapter,
+            endChapter: f.endChapter,
+            chapterCount: Array.isArray(f.chapters) ? f.chapters.length : 0,
+            contentLen: (f.content || '').length
+        })));
 
-        state.batchFiles = [];
-        renderBatchFiles();
-        switchPage('tasks');
-        refreshTasks();
-    } else {
-        if (data.duplicates && data.duplicates.length > 0) {
-            const names = data.duplicates.map(x => x.fileName).join('、');
-            showToast(`重复提交，未进入队列：${names}`, 'warning');
+        const data = await api('/api/batch', {
+            method: 'POST',
+            body: JSON.stringify({
+                userId: 'default',
+                files,
+                batchSize: globalBatchSize,
+                delayMin,
+                delayMax
+            }),
+        });
+
+        hideLoading();
+
+        if (data.success) {
+            let msg = `任务已提交：${data.totalChapters} 个章节`;
+            if (data.queuedFiles !== undefined) msg += `，入队 ${data.queuedFiles} 本`;
+            if (data.duplicateFiles && data.duplicateFiles.length > 0) msg += `，重复跳过 ${data.duplicateFiles.length} 本`;
+            showToast(msg, 'success');
+
+            if (data.duplicateFiles && data.duplicateFiles.length > 0) {
+                const duplicateNames = data.duplicateFiles.map(x => x.fileName).join('、');
+                showToast(`重复跳过：${duplicateNames}`, 'warning');
+            }
+
+            state.currentPage = 'tasks';
+            showPage('tasks');
+            await loadTasks();
         } else {
-            showToast('提交失败: ' + (data.error || ''), 'error');
+            showToast(data.error || '提交失败', 'error');
         }
+    } catch (e) {
+        hideLoading();
+        console.error('submitBatch error:', e);
+        showToast(`提交失败：${e.message || e}`, 'error');
     }
-}
+}   
 
 // ==================== 任务 ====================
 async function refreshTasks() {
