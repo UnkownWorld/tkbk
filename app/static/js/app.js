@@ -795,24 +795,37 @@ function renderBatchSubmitArea() {
 
     if (!card) return;
 
+    let info = card.querySelector('.batch-submit-info');
+    if (!info) {
+        info = document.createElement('div');
+        info.className = 'batch-submit-info';
+        info.style.fontSize = '13px';
+        info.style.color = 'var(--text-secondary)';
+        info.style.marginBottom = '12px';
+
+        // 插到 card-title 后面、按钮区前面
+        const title = card.querySelector('.card-title');
+        if (title && title.nextSibling) {
+            card.insertBefore(info, title.nextSibling);
+        } else if (title) {
+            card.appendChild(info);
+        } else {
+            card.insertBefore(info, card.firstChild);
+        }
+    }
+
     if (!state.batchFiles.length) {
-        card.innerHTML = `
-            <div class="empty-state">
-                <p>上传 TXT 后即可提交批处理</p>
-            </div>
-        `;
+        info.textContent = '上传 TXT 后即可提交批处理';
         return;
     }
 
-    card.innerHTML = `
-        <div style="font-size:13px;color:var(--text-secondary);">
-            当前待提交：<strong>${state.batchFiles.length}</strong> 本，
-            总预览章节数：<strong>${
-                state.batchFiles.reduce((sum, f) => sum + Math.max(1, (f.previewChapters || []).length || 1), 0)
-            }</strong>
-        </div>
-    `;
+    const totalPreview = state.batchFiles.reduce((sum, f) => {
+        return sum + Math.max(1, (f.previewChapters || []).length || 1);
+    }, 0);
+
+    info.innerHTML = `当前待提交：<strong>${state.batchFiles.length}</strong> 本，总预览章节 <strong>${totalPreview}</strong>`;
 }
+
 
 async function handleBatchFiles(files) {
     const txtFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.txt'));
