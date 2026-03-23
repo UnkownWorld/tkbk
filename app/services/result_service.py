@@ -135,9 +135,9 @@ class ResultService:
                 "error": "未配置 HF Token/Dataset"
             }
 
-        export_text = self.build_single_book_export_text(task_id, book_task)
-        safe_name = _sanitize_filename(file_name)
-        upload_filename = f"{safe_name}-节奏.txt"
+        download_payload = self.build_download_payload_for_single_book(task_id, book_task)
+        export_text = download_payload.get("content", "")
+        upload_filename = download_payload.get("filename") or f"{_sanitize_filename(file_name)}-节奏.txt"
 
         result = file_service.upload_text_to_dataset(
             hf_token=hf_token,
@@ -155,6 +155,8 @@ class ResultService:
 
         logger.error(f"[{task_id}] [{file_name}] 上传 HF 失败: {result.get('error')}")
         return result
+
+
 
     # ==================== 下载输出 ====================
 
